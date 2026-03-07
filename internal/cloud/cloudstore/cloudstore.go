@@ -699,6 +699,205 @@ func (cs *CloudStore) FormatContext(userID, project, scope string) (string, erro
 	return b.String(), nil
 }
 
+// ─── Dashboard Queries ──────────────────────────────────────────────────
+
+// ProjectStat holds per-project aggregate data for the dashboard overview.
+type ProjectStat struct {
+	Project          string  `json:"project"`
+	SessionCount     int     `json:"session_count"`
+	ObservationCount int     `json:"observation_count"`
+	PromptCount      int     `json:"prompt_count"`
+	LastActivity     *string `json:"last_activity,omitempty"`
+}
+
+// ProjectStats returns per-project statistics for a user, ordered by most
+// recent activity. Used by the dashboard overview (Phase 4).
+func (cs *CloudStore) ProjectStats(userID string) ([]ProjectStat, error) {
+	rows, err := cs.db.Query(`
+		SELECT
+			p.project,
+			COALESCE(s.session_count, 0),
+			COALESCE(o.obs_count, 0),
+			COALESCE(pr.prompt_count, 0),
+			GREATEST(s.last_session, o.last_obs, pr.last_prompt) AS last_activity
+		FROM (
+			SELECT DISTINCT COALESCE(project, '') AS project FROM cloud_sessions WHERE user_id = $1
+			UNION
+			SELECT DISTINCT COALESCE(project, '') AS project FROM cloud_observations WHERE user_id = $1 AND deleted_at IS NULL
+			UNION
+			SELECT DISTINCT COALESCE(project, '') AS project FROM cloud_prompts WHERE user_id = $1
+		) p
+		LEFT JOIN (
+			SELECT project, COUNT(*) AS session_count, MAX(started_at) AS last_session
+			FROM cloud_sessions WHERE user_id = $1 GROUP BY project
+		) s ON s.project = p.project
+		LEFT JOIN (
+			SELECT COALESCE(project, '') AS project, COUNT(*) AS obs_count, MAX(created_at) AS last_obs
+			FROM cloud_observations WHERE user_id = $1 AND deleted_at IS NULL GROUP BY COALESCE(project, '')
+		) o ON o.project = p.project
+		LEFT JOIN (
+			SELECT COALESCE(project, '') AS project, COUNT(*) AS prompt_count, MAX(created_at) AS last_prompt
+			FROM cloud_prompts WHERE user_id = $1 GROUP BY COALESCE(project, '')
+		) pr ON pr.project = p.project
+		WHERE p.project != ''
+		ORDER BY last_activity DESC NULLS LAST
+	`, userID)
+	if err != nil {
+		return nil, fmt.Errorf("cloudstore: project stats: %w", err)
+	}
+	defer rows.Close()
+
+	var results []ProjectStat
+	for rows.Next() {
+		var ps ProjectStat
+		if err := rows.Scan(&ps.Project, &ps.SessionCount, &ps.ObservationCount, &ps.PromptCount, &ps.LastActivity); err != nil {
+			return nil, fmt.Errorf("cloudstore: scan project stat: %w", err)
+		}
+		results = append(results, ps)
+	}
+	if results == nil {
+		results = []ProjectStat{}
+	}
+	return results, rows.Err()
+}
+
+// ContributorStat holds per-user aggregate data for the contributors view.
+type ContributorStat struct {
+	UserID           string  `json:"user_id"`
+	Username         string  `json:"username"`
+	Email            string  `json:"email"`
+	SessionCount     int     `json:"session_count"`
+	ObservationCount int     `json:"observation_count"`
+	LastSync         *string `json:"last_sync,omitempty"`
+}
+
+// ContributorStats returns per-user statistics across the whole system.
+// This is an admin/org-level query (Phase 7).
+func (cs *CloudStore) ContributorStats() ([]ContributorStat, error) {
+	rows, err := cs.db.Query(`
+		SELECT
+			u.id, u.username, u.email,
+			COALESCE(s.cnt, 0),
+			COALESCE(o.cnt, 0),
+			GREATEST(s.last_session, o.last_obs) AS last_sync
+		FROM cloud_users u
+		LEFT JOIN (
+			SELECT user_id, COUNT(*) AS cnt, MAX(started_at) AS last_session
+			FROM cloud_sessions GROUP BY user_id
+		) s ON s.user_id = u.id
+		LEFT JOIN (
+			SELECT user_id, COUNT(*) AS cnt, MAX(created_at) AS last_obs
+			FROM cloud_observations WHERE deleted_at IS NULL GROUP BY user_id
+		) o ON o.user_id = u.id
+		ORDER BY last_sync DESC NULLS LAST
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("cloudstore: contributor stats: %w", err)
+	}
+	defer rows.Close()
+
+	var results []ContributorStat
+	for rows.Next() {
+		var c ContributorStat
+		if err := rows.Scan(&c.UserID, &c.Username, &c.Email, &c.SessionCount, &c.ObservationCount, &c.LastSync); err != nil {
+			return nil, fmt.Errorf("cloudstore: scan contributor stat: %w", err)
+		}
+		results = append(results, c)
+	}
+	if results == nil {
+		results = []ContributorStat{}
+	}
+	return results, rows.Err()
+}
+
+// ListAllUsers returns all registered users with their API key status.
+// Used by the admin user management view (Phase 8).
+func (cs *CloudStore) ListAllUsers() ([]CloudUser, error) {
+	rows, err := cs.db.Query(`
+		SELECT id, username, email, password_hash, api_key_hash, created_at, updated_at
+		FROM cloud_users
+		ORDER BY created_at DESC
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("cloudstore: list all users: %w", err)
+	}
+	defer rows.Close()
+
+	var results []CloudUser
+	for rows.Next() {
+		var u CloudUser
+		if err := rows.Scan(&u.ID, &u.Username, &u.Email, &u.PasswordHash, &u.APIKeyHash, &u.CreatedAt, &u.UpdatedAt); err != nil {
+			return nil, fmt.Errorf("cloudstore: scan user: %w", err)
+		}
+		results = append(results, u)
+	}
+	if results == nil {
+		results = []CloudUser{}
+	}
+	return results, rows.Err()
+}
+
+// SystemHealthInfo holds system health metrics for admin views.
+type SystemHealthInfo struct {
+	DBConnected    bool   `json:"db_connected"`
+	TotalUsers     int    `json:"total_users"`
+	TotalSessions  int    `json:"total_sessions"`
+	TotalMemories  int    `json:"total_memories"`
+	TotalPrompts   int    `json:"total_prompts"`
+	TotalMutations int    `json:"total_mutations"`
+	DBVersion      string `json:"db_version"`
+}
+
+// SystemHealth returns system-wide health metrics for admin views (Phase 8).
+func (cs *CloudStore) SystemHealth() (*SystemHealthInfo, error) {
+	h := &SystemHealthInfo{}
+
+	if err := cs.db.Ping(); err != nil {
+		h.DBConnected = false
+		return h, nil
+	}
+	h.DBConnected = true
+
+	cs.db.QueryRow(`SELECT COUNT(*) FROM cloud_users`).Scan(&h.TotalUsers)
+	cs.db.QueryRow(`SELECT COUNT(*) FROM cloud_sessions`).Scan(&h.TotalSessions)
+	cs.db.QueryRow(`SELECT COUNT(*) FROM cloud_observations WHERE deleted_at IS NULL`).Scan(&h.TotalMemories)
+	cs.db.QueryRow(`SELECT COUNT(*) FROM cloud_prompts`).Scan(&h.TotalPrompts)
+	cs.db.QueryRow(`SELECT COUNT(*) FROM cloud_mutations`).Scan(&h.TotalMutations)
+	cs.db.QueryRow(`SELECT version()`).Scan(&h.DBVersion)
+
+	return h, nil
+}
+
+// UserProjects returns distinct project names for a user.
+func (cs *CloudStore) UserProjects(userID string) ([]string, error) {
+	rows, err := cs.db.Query(`
+		SELECT DISTINCT COALESCE(project, '') AS project
+		FROM cloud_observations
+		WHERE user_id = $1 AND deleted_at IS NULL AND project IS NOT NULL AND project != ''
+		UNION
+		SELECT DISTINCT project FROM cloud_sessions
+		WHERE user_id = $1 AND project != ''
+		ORDER BY project
+	`, userID)
+	if err != nil {
+		return nil, fmt.Errorf("cloudstore: user projects: %w", err)
+	}
+	defer rows.Close()
+
+	var results []string
+	for rows.Next() {
+		var p string
+		if err := rows.Scan(&p); err != nil {
+			return nil, fmt.Errorf("cloudstore: scan project: %w", err)
+		}
+		results = append(results, p)
+	}
+	if results == nil {
+		results = []string{}
+	}
+	return results, rows.Err()
+}
+
 // ─── Mutations (append-only per-user ledger for sync) ───────────────────
 
 // CloudMutation represents a single append-only mutation in the cloud ledger.

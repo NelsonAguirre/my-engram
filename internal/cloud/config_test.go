@@ -29,6 +29,27 @@ func TestConfigFromEnvPrefersCanonicalNames(t *testing.T) {
 	}
 }
 
+func TestConfigFromEnvParsesAdminEmail(t *testing.T) {
+	t.Setenv("ENGRAM_CLOUD_ADMIN", "  admin@example.com  ")
+
+	cfg := ConfigFromEnv()
+
+	if cfg.AdminEmail != "admin@example.com" {
+		t.Fatalf("admin email = %q, expected %q", cfg.AdminEmail, "admin@example.com")
+	}
+}
+
+func TestConfigFromEnvAdminEmailEmpty(t *testing.T) {
+	// Ensure ENGRAM_CLOUD_ADMIN is not set.
+	t.Setenv("ENGRAM_CLOUD_ADMIN", "")
+
+	cfg := ConfigFromEnv()
+
+	if cfg.AdminEmail != "" {
+		t.Fatalf("admin email should be empty, got %q", cfg.AdminEmail)
+	}
+}
+
 func TestConfigFromEnvFallsBackToLegacyNames(t *testing.T) {
 	t.Setenv("ENGRAM_DATABASE_URL", "")
 	t.Setenv("ENGRAM_JWT_SECRET", "")

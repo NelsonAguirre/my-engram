@@ -16,6 +16,7 @@ type Config struct {
 	CORSOrigins []string // Allowed CORS origins
 	MaxPool     int      // Maximum database connection pool size
 	Port        int      // HTTP port for cloud server mode
+	AdminEmail  string   // Email of the admin user (enables Admin tab in dashboard)
 }
 
 // DefaultConfig returns a Config with sensible defaults for local development.
@@ -40,6 +41,7 @@ func DefaultConfig() Config {
 //   - ENGRAM_CLOUD_CORS_ORIGINS: Comma-separated list of allowed origins
 //   - ENGRAM_CLOUD_MAX_POOL: Maximum DB connection pool size
 //   - ENGRAM_PORT: HTTP port for cloud server mode
+//   - ENGRAM_CLOUD_ADMIN: Admin user email (enables Admin tab in dashboard)
 func ConfigFromEnv() Config {
 	cfg := DefaultConfig()
 
@@ -68,6 +70,9 @@ func ConfigFromEnv() Config {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			cfg.Port = n
 		}
+	}
+	if v := os.Getenv("ENGRAM_CLOUD_ADMIN"); v != "" {
+		cfg.AdminEmail = strings.TrimSpace(v)
 	}
 
 	return cfg
