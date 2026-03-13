@@ -3912,3 +3912,96 @@ func TestMixedEnrolledAndEmptyProjectMutations(t *testing.T) {
 		t.Fatal("expected empty-project (global) mutations to appear")
 	}
 }
+
+// ─── MigrateProject ─────────────────────────────────────────────────────────
+
+func TestMigrateProject(t *testing.T) {
+	s := newTestStore(t)
+	old, new_ := "old-name", "new-name"
+
+	// Seed data under old project name
+	s.CreateSession("s1", old, "/tmp/old")
+	s.AddObservation(AddObservationParams{
+		SessionID: "s1", Type: "decision", Title: "test obs",
+		Content: "some content", Project: old, Scope: "project",
+	})
+	s.AddPrompt(AddPromptParams{SessionID: "s1", Content: "test prompt", Project: old})
+
+	// Run migration
+	result, err := s.MigrateProject(old, new_)
+	if err != nil {
+		t.Fatalf("MigrateProject: %v", err)
+	}
+	if !result.Migrated {
+		t.Fatal("expected migration to happen")
+	}
+	if result.ObservationsUpdated != 1 {
+		t.Fatalf("expected 1 observation migrated, got %d", result.ObservationsUpdated)
+	}
+	if result.SessionsUpdated != 1 {
+		t.Fatalf("expected 1 session migrated, got %d", result.SessionsUpdated)
+	}
+	if result.PromptsUpdated != 1 {
+		t.Fatalf("expected 1 prompt migrated, got %d", result.PromptsUpdated)
+	}
+
+	// Verify old project has no records
+	obs, _ := s.RecentObservations(old, "", 10)
+	if len(obs) != 0 {
+		t.Fatalf("expected 0 observations under old name, got %d", len(obs))
+	}
+
+	// Verify new project has the records
+	obs, _ = s.RecentObservations(new_, "", 10)
+	if len(obs) != 1 {
+		t.Fatalf("expected 1 observation under new name, got %d", len(obs))
+	}
+
+	// Verify FTS search finds it under new project
+	results, _ := s.Search("test obs", SearchOptions{Project: new_, Limit: 10})
+	if len(results) != 1 {
+		t.Fatalf("expected FTS to find 1 result under new project, got %d", len(results))
+	}
+}
+
+func TestMigrateProjectNoOp(t *testing.T) {
+	s := newTestStore(t)
+
+	// No records under "nonexistent" — should be a no-op
+	result, err := s.MigrateProject("nonexistent", "anything")
+	if err != nil {
+		t.Fatalf("MigrateProject: %v", err)
+	}
+	if result.Migrated {
+		t.Fatal("expected no migration for nonexistent project")
+	}
+}
+
+func TestMigrateProjectIdempotent(t *testing.T) {
+	s := newTestStore(t)
+	old, new_ := "old-proj", "new-proj"
+
+	s.CreateSession("s1", old, "/tmp")
+	s.AddObservation(AddObservationParams{
+		SessionID: "s1", Type: "decision", Title: "test",
+		Content: "content", Project: old, Scope: "project",
+	})
+
+	// First migration
+	r1, err := s.MigrateProject(old, new_)
+	if err != nil {
+		t.Fatalf("first MigrateProject: %v", err)
+	}
+	if !r1.Migrated {
+		t.Fatal("first migration should migrate")
+	}
+
+	// Second migration — no records under old name anymore
+	r2, err := s.MigrateProject(old, new_)
+	if err != nil {
+		t.Fatalf("second MigrateProject: %v", err)
+	}
+	if r2.Migrated {
+		t.Fatal("second migration should be a no-op")
+	}
+}

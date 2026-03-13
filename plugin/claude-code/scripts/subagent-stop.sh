@@ -8,12 +8,16 @@
 ENGRAM_PORT="${ENGRAM_PORT:-7437}"
 ENGRAM_URL="http://127.0.0.1:${ENGRAM_PORT}"
 
+# Load shared helpers
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+source "${SCRIPT_DIR}/_helpers.sh"
+
 # Read hook input from stdin
 INPUT=$(cat)
 SESSION_ID=$(echo "$INPUT" | jq -r '.session_id // empty')
 CWD=$(echo "$INPUT" | jq -r '.cwd // empty')
 OUTPUT=$(echo "$INPUT" | jq -r '.stdout // empty')
-PROJECT=$(basename "$CWD")
+PROJECT=$(detect_project "$CWD")
 
 # Nothing to capture if no output
 [ -z "$OUTPUT" ] && exit 0

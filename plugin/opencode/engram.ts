@@ -154,6 +154,28 @@ async function isEngramRunning(): Promise<boolean> {
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 function extractProjectName(directory: string): string {
+  // Try git remote origin URL
+  try {
+    const result = Bun.spawnSync(["git", "-C", directory, "remote", "get-url", "origin"])
+    if (result.exitCode === 0) {
+      const url = result.stdout?.toString().trim()
+      if (url) {
+        const name = url.replace(/\.git$/, "").split(/[/:]/).pop()
+        if (name) return name
+      }
+    }
+  } catch {}
+
+  // Fallback: git root directory name (works in worktrees)
+  try {
+    const result = Bun.spawnSync(["git", "-C", directory, "rev-parse", "--show-toplevel"])
+    if (result.exitCode === 0) {
+      const root = result.stdout?.toString().trim()
+      if (root) return root.split("/").pop() ?? "unknown"
+    }
+  } catch {}
+
+  // Final fallback: cwd basename
   return directory.split("/").pop() ?? "unknown"
 }
 
@@ -175,6 +197,7 @@ function stripPrivateTags(str: string): string {
 // ─── Plugin Export ───────────────────────────────────────────────────────────
 
 export const Engram: Plugin = async (ctx) => {
+  const oldProject = ctx.directory.split("/").pop() ?? "unknown"
   const project = extractProjectName(ctx.directory)
 
   // Track tool counts per session (in-memory only, not critical)
@@ -213,6 +236,15 @@ export const Engram: Plugin = async (ctx) => {
     } catch {
       // Binary not found or can't start — plugin will silently no-op
     }
+  }
+
+  // Migrate project name if it changed (one-time, idempotent)
+  // Must run AFTER server startup to ensure the endpoint is available
+  if (oldProject !== project) {
+    await engramFetch("/projects/migrate", {
+      method: "POST",
+      body: { old_project: oldProject, new_project: project },
+    })
   }
 
   // Auto-import: if .engram/manifest.json exists in the project repo,

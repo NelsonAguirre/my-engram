@@ -131,6 +131,9 @@ func (s *Server) routes() {
 	// Stats
 	s.mux.HandleFunc("GET /stats", s.handleStats)
 
+	// Project migration
+	s.mux.HandleFunc("POST /projects/migrate", s.handleMigrateProject)
+
 	// Sync status (degraded-state visibility for autosync)
 	s.mux.HandleFunc("GET /sync/status", s.handleSyncStatus)
 }
@@ -509,6 +512,53 @@ func (s *Server) handleSyncStatus(w http.ResponseWriter, r *http.Request) {
 		"consecutive_failures": status.ConsecutiveFailures,
 		"backoff_until":        status.BackoffUntil,
 		"last_sync_at":         status.LastSyncAt,
+	})
+}
+
+// ─── Project Migration ───────────────────────────────────────────────────────
+
+func (s *Server) handleMigrateProject(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<10) // 1 KB max
+	var body struct {
+		OldProject string `json:"old_project"`
+		NewProject string `json:"new_project"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		jsonError(w, http.StatusBadRequest, "invalid JSON")
+		return
+	}
+	if body.OldProject == "" || body.NewProject == "" {
+		jsonError(w, http.StatusBadRequest, "old_project and new_project are required")
+		return
+	}
+	if body.OldProject == body.NewProject {
+		jsonResponse(w, http.StatusOK, map[string]any{"status": "skipped", "reason": "names are identical"})
+		return
+	}
+
+	result, err := s.store.MigrateProject(body.OldProject, body.NewProject)
+	if err != nil {
+		log.Printf("[engram] project migration failed: %v", err)
+		jsonError(w, http.StatusInternalServerError, "migration failed")
+		return
+	}
+
+	if !result.Migrated {
+		jsonResponse(w, http.StatusOK, map[string]any{"status": "skipped", "reason": "no records found"})
+		return
+	}
+
+	log.Printf("[engram] migrated project %q → %q (obs: %d, sessions: %d, prompts: %d)",
+		body.OldProject, body.NewProject,
+		result.ObservationsUpdated, result.SessionsUpdated, result.PromptsUpdated)
+
+	jsonResponse(w, http.StatusOK, map[string]any{
+		"status":       "migrated",
+		"old_project":  body.OldProject,
+		"new_project":  body.NewProject,
+		"observations": result.ObservationsUpdated,
+		"sessions":     result.SessionsUpdated,
+		"prompts":      result.PromptsUpdated,
 	})
 }
 

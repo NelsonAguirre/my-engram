@@ -9,11 +9,16 @@
 ENGRAM_PORT="${ENGRAM_PORT:-7437}"
 ENGRAM_URL="http://127.0.0.1:${ENGRAM_PORT}"
 
+# Load shared helpers
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+source "${SCRIPT_DIR}/_helpers.sh"
+
 # Read hook input from stdin
 INPUT=$(cat)
 SESSION_ID=$(echo "$INPUT" | jq -r '.session_id // empty')
 CWD=$(echo "$INPUT" | jq -r '.cwd // empty')
-PROJECT=$(basename "$CWD")
+OLD_PROJECT=$(basename "$CWD")
+PROJECT=$(detect_project "$CWD")
 
 # Ensure engram server is running
 if ! curl -sf "${ENGRAM_URL}/health" --max-time 1 > /dev/null 2>&1; then
@@ -21,12 +26,23 @@ if ! curl -sf "${ENGRAM_URL}/health" --max-time 1 > /dev/null 2>&1; then
   sleep 0.5
 fi
 
+# Migrate project name if it changed (one-time, idempotent)
+if [ "$OLD_PROJECT" != "$PROJECT" ] && [ -n "$OLD_PROJECT" ] && [ -n "$PROJECT" ]; then
+  curl -sf "${ENGRAM_URL}/projects/migrate" \
+    -X POST \
+    -H "Content-Type: application/json" \
+    -d "$(jq -n --arg old "$OLD_PROJECT" --arg new "$PROJECT" \
+      '{old_project: $old, new_project: $new}')" \
+    > /dev/null 2>&1
+fi
+
 # Create session
 if [ -n "$SESSION_ID" ] && [ -n "$PROJECT" ]; then
   curl -sf "${ENGRAM_URL}/sessions" \
     -X POST \
     -H "Content-Type: application/json" \
-    -d "{\"id\":\"${SESSION_ID}\",\"project\":\"${PROJECT}\",\"directory\":\"${CWD}\"}" \
+    -d "$(jq -n --arg id "$SESSION_ID" --arg project "$PROJECT" --arg dir "$CWD" \
+      '{id: $id, project: $project, directory: $dir}')" \
     > /dev/null 2>&1
 fi
 
@@ -36,7 +52,8 @@ if [ -f "${CWD}/.engram/manifest.json" ]; then
 fi
 
 # Fetch memory context
-CONTEXT=$(curl -sf "${ENGRAM_URL}/context?project=${PROJECT}" --max-time 3 2>/dev/null | jq -r '.context // empty')
+ENCODED_PROJECT=$(printf '%s' "$PROJECT" | jq -sRr @uri)
+CONTEXT=$(curl -sf "${ENGRAM_URL}/context?project=${ENCODED_PROJECT}" --max-time 3 2>/dev/null | jq -r '.context // empty')
 
 # Inject Memory Protocol + context — stdout goes to Claude as additionalContext
 cat <<'PROTOCOL'

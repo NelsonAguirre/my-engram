@@ -2075,6 +2075,69 @@ func (s *Store) IsProjectEnrolled(project string) (bool, error) {
 	return true, nil
 }
 
+// ─── Project Migration ───────────────────────────────────────────────────────
+
+type MigrateResult struct {
+	Migrated            bool  `json:"migrated"`
+	ObservationsUpdated int64 `json:"observations_updated"`
+	SessionsUpdated     int64 `json:"sessions_updated"`
+	PromptsUpdated      int64 `json:"prompts_updated"`
+}
+
+func (s *Store) MigrateProject(oldName, newName string) (*MigrateResult, error) {
+	if oldName == "" || newName == "" || oldName == newName {
+		return &MigrateResult{}, nil
+	}
+
+	// Check if old project has any records (short-circuit on first match)
+	var exists bool
+	err := s.db.QueryRow(
+		`SELECT EXISTS(
+			SELECT 1 FROM observations WHERE project = ?
+			UNION ALL
+			SELECT 1 FROM sessions WHERE project = ?
+			UNION ALL
+			SELECT 1 FROM user_prompts WHERE project = ?
+		)`, oldName, oldName, oldName,
+	).Scan(&exists)
+	if err != nil {
+		return nil, fmt.Errorf("check old project: %w", err)
+	}
+	if !exists {
+		return &MigrateResult{}, nil
+	}
+
+	result := &MigrateResult{Migrated: true}
+
+	err = s.withTx(func(tx *sql.Tx) error {
+		// FTS triggers handle index updates automatically on UPDATE
+		res, err := s.execHook(tx, `UPDATE observations SET project = ? WHERE project = ?`, newName, oldName)
+		if err != nil {
+			return fmt.Errorf("migrate observations: %w", err)
+		}
+		result.ObservationsUpdated, _ = res.RowsAffected()
+
+		res, err = s.execHook(tx, `UPDATE sessions SET project = ? WHERE project = ?`, newName, oldName)
+		if err != nil {
+			return fmt.Errorf("migrate sessions: %w", err)
+		}
+		result.SessionsUpdated, _ = res.RowsAffected()
+
+		res, err = s.execHook(tx, `UPDATE user_prompts SET project = ? WHERE project = ?`, newName, oldName)
+		if err != nil {
+			return fmt.Errorf("migrate prompts: %w", err)
+		}
+		result.PromptsUpdated, _ = res.RowsAffected()
+
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return result, nil
+}
+
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 func (s *Store) withTx(fn func(tx *sql.Tx) error) error {
