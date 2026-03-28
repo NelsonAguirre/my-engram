@@ -4677,3 +4677,171 @@ func TestSyncApplyDoesNotBumpAccess(t *testing.T) {
 		t.Fatalf("access_count = %d after sync apply, want 0 (sync path must not bump)", accessCount)
 	}
 }
+
+// ─── T3.1: accessBoost tests ───────────────────────────────────────────────────
+
+func TestAccessBoost(t *testing.T) {
+	tests := []struct {
+		name        string
+		accessCount int
+		wantMin     float64
+		wantMax     float64
+	}{
+		{"zero access", 0, 1.0, 1.0},
+		{"one access", 1, 1.09, 1.12},         // 1.0 + ln(2) * 0.15 ≈ 1.104
+		{"ten accesses", 10, 1.34, 1.37},      // 1.0 + ln(11) * 0.15 ≈ 1.358
+		{"hundred accesses", 100, 1.67, 1.70}, // 1.0 + ln(101) * 0.15 ≈ 1.691
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := accessBoost(tt.accessCount)
+			if got < tt.wantMin || got > tt.wantMax {
+				t.Errorf("accessBoost(%d) = %v, want [%v, %v]", tt.accessCount, got, tt.wantMin, tt.wantMax)
+			}
+		})
+	}
+}
+
+// ─── T3.2: Search ranking with access boost ───────────────────────────────────
+
+func TestSearchRanksByAccessCount(t *testing.T) {
+	s := newTestStore(t)
+
+	if err := s.CreateSession("s1", "proj", "/tmp/proj"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	// Create two observations with identical content (same BM25)
+	obsID1, err := s.AddObservation(AddObservationParams{
+		SessionID: "s1",
+		Type:      "decision",
+		Title:     "Test memory 1",
+		Content:   "This is a test memory for ranking",
+		Project:   "proj",
+		Scope:     "project",
+	})
+	if err != nil {
+		t.Fatalf("add observation 1: %v", err)
+	}
+
+	obsID2, err := s.AddObservation(AddObservationParams{
+		SessionID: "s1",
+		Type:      "decision",
+		Title:     "Test memory 2",
+		Content:   "This is a test memory for ranking",
+		Project:   "proj",
+		Scope:     "project",
+	})
+	if err != nil {
+		t.Fatalf("add observation 2: %v", err)
+	}
+
+	// Access the second observation 10 times to simulate higher usage
+	for i := 0; i < 10; i++ {
+		_, err := s.GetObservation(obsID2)
+		if err != nil {
+			t.Fatalf("get observation for access bump: %v", err)
+		}
+	}
+
+	// Search for "memory" - should return both observations
+	results, err := s.Search("memory", SearchOptions{Limit: 10, Project: "proj"})
+	if err != nil {
+		t.Fatalf("search: %v", err)
+	}
+
+	if len(results) < 2 {
+		t.Fatalf("expected at least 2 results, got %d", len(results))
+	}
+
+	// Find the positions of both observations in results
+	var pos1, pos2 int = -1, -1
+	for i, r := range results {
+		if r.ID == obsID1 {
+			pos1 = i
+		}
+		if r.ID == obsID2 {
+			pos2 = i
+		}
+	}
+
+	// The more-accessed observation should rank higher (come first)
+	// Note: directResults from topic_key are excluded - both should be FTS results
+	if pos1 == -1 || pos2 == -1 {
+		t.Fatalf("could not find both observations in results: pos1=%d, pos2=%d", pos1, pos2)
+	}
+
+	// The higher-access observation should come first (lower index)
+	if pos2 > pos1 {
+		t.Errorf("expected observation with more accesses to rank first: obs1(pos=%d) vs obs2(pos=%d)", pos1, pos2)
+	}
+}
+
+// ─── T3.3: Verify topic_key path unaffected by ranking ────────────────────────
+
+func TestSearchTopicKeyNotAffectedByAccessBoost(t *testing.T) {
+	s := newTestStore(t)
+
+	if err := s.CreateSession("s1", "proj", "/tmp/proj"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	// Create observation with topic_key and 0 access
+	obsID1, err := s.AddObservation(AddObservationParams{
+		SessionID: "s1",
+		Type:      "decision",
+		Title:     "Topic key test",
+		Content:   "Topic key observation",
+		Project:   "proj",
+		Scope:     "project",
+		TopicKey:  "test/topic-key-affected",
+	})
+	if err != nil {
+		t.Fatalf("add observation with topic_key: %v", err)
+	}
+
+	// Create another observation with same content but NOT topic_key (high access)
+	obsID2, err := s.AddObservation(AddObservationParams{
+		SessionID: "s1",
+		Type:      "decision",
+		Title:     "Topic key test",
+		Content:   "Topic key observation",
+		Project:   "proj",
+		Scope:     "project",
+	})
+	if err != nil {
+		t.Fatalf("add observation without topic_key: %v", err)
+	}
+
+	// Access the second observation many times to simulate high usage
+	for i := 0; i < 100; i++ {
+		_, err := s.GetObservation(obsID2)
+		if err != nil {
+			t.Fatalf("get observation for access bump: %v", err)
+		}
+	}
+
+	// Search using topic_key path - "/" triggers topic_key exact match
+	results, err := s.Search("test/topic-key-affected", SearchOptions{Limit: 10, Project: "proj"})
+	if err != nil {
+		t.Fatalf("search with topic_key: %v", err)
+	}
+
+	// Must have at least 1 result (the topic_key match)
+	if len(results) < 1 {
+		t.Fatalf("expected at least 1 result (topic_key match), got %d", len(results))
+	}
+
+	// First result should be the topic_key match (obsID1), regardless of access count
+	if results[0].ID != obsID1 {
+		t.Errorf("expected topic_key observation (id=%d) to be first, got id=%d (access_count=%d)",
+			obsID1, results[0].ID, results[0].AccessCount)
+	}
+
+	// Topic_key exact-match results must have Rank = -1000
+	// Not affected by access boost (they don't go through FTS re-ranking)
+	if results[0].Rank != -1000 {
+		t.Errorf("expected first result to have Rank=-1000 (topic_key path), got %v", results[0].Rank)
+	}
+}

@@ -13,9 +13,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math"
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -1713,6 +1715,9 @@ func (s *Store) Search(query string, opts SearchOptions) ([]SearchResult, error)
 	// Sanitize query for FTS5 — wrap each term in quotes to avoid syntax errors
 	ftsQuery := sanitizeFTS(query)
 
+	// Over-fetch by 3x to allow room for re-ranking with access boost
+	fetchLimit := limit * 3
+
 	sqlQ := `
 		SELECT o.id, ifnull(o.sync_id, '') as sync_id, o.session_id, o.type, o.title, o.content, o.tool_name, o.project,
 		       o.scope, o.topic_key, o.revision_count, o.duplicate_count, o.last_seen_at, o.access_count, o.last_accessed_at, o.created_at, o.updated_at, o.deleted_at,
@@ -1739,7 +1744,7 @@ func (s *Store) Search(query string, opts SearchOptions) ([]SearchResult, error)
 	}
 
 	sqlQ += " ORDER BY fts.rank LIMIT ?"
-	args = append(args, limit)
+	args = append(args, fetchLimit)
 
 	rows, err := s.queryItHook(s.db, sqlQ, args...)
 	if err != nil {
@@ -1752,8 +1757,7 @@ func (s *Store) Search(query string, opts SearchOptions) ([]SearchResult, error)
 		seen[dr.ID] = true
 	}
 
-	var results []SearchResult
-	results = append(results, directResults...)
+	var ftsResults []SearchResult
 	for rows.Next() {
 		var sr SearchResult
 		if err := rows.Scan(
@@ -1766,12 +1770,25 @@ func (s *Store) Search(query string, opts SearchOptions) ([]SearchResult, error)
 			return nil, err
 		}
 		if !seen[sr.ID] {
-			results = append(results, sr)
+			// Apply access boost: multiply BM25 rank by boost factor
+			// More negative BM25 (better match) * positive boost = still more negative
+			sr.Rank = sr.Rank * accessBoost(sr.AccessCount)
+			ftsResults = append(ftsResults, sr)
 		}
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
+
+	// Sort FTS results by boosted rank (ascending: more negative = better)
+	sort.Slice(ftsResults, func(i, j int) bool {
+		return ftsResults[i].Rank < ftsResults[j].Rank
+	})
+
+	// Combine: directResults (topic_key exact match) first, then re-ranked FTS results
+	var results []SearchResult
+	results = append(results, directResults...)
+	results = append(results, ftsResults...)
 
 	if len(results) > limit {
 		results = results[:limit]
@@ -3282,6 +3299,13 @@ func sanitizeFTS(query string) string {
 		words[i] = `"` + w + `"`
 	}
 	return strings.Join(words, " ")
+}
+
+// accessBoost computes a rank multiplier based on observation access count.
+// More accesses = higher boost. Formula: 1.0 + log1p(accessCount) * 0.15
+// This is used to hybrid-rank FTS5 results with usage signal.
+func accessBoost(accessCount int) float64 {
+	return 1.0 + math.Log1p(float64(accessCount))*0.15
 }
 
 // ─── Passive Capture ─────────────────────────────────────────────────────────
