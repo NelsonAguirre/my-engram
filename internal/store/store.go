@@ -12,6 +12,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -19,6 +20,7 @@ import (
 	"strings"
 	"time"
 
+	"gopkg.in/yaml.v3"
 	_ "modernc.org/sqlite"
 )
 
@@ -49,6 +51,8 @@ type Observation struct {
 	RevisionCount  int     `json:"revision_count"`
 	DuplicateCount int     `json:"duplicate_count"`
 	LastSeenAt     *string `json:"last_seen_at,omitempty"`
+	AccessCount    int     `json:"access_count"`
+	LastAccessedAt *string `json:"last_accessed_at,omitempty"`
 	CreatedAt      string  `json:"created_at"`
 	UpdatedAt      string  `json:"updated_at"`
 	DeletedAt      *string `json:"deleted_at,omitempty"`
@@ -278,12 +282,66 @@ func (s *Store) MaxObservationLength() int {
 	return s.cfg.MaxObservationLength
 }
 
+// ─── GC Config ───────────────────────────────────────────────────────────────
+
+// GCConfig holds GC-specific settings read from config.yaml.
+type GCConfig struct {
+	GCMode                  string `yaml:"gc_mode"`
+	UnusedThresholdDays     int    `yaml:"unused_threshold_days"`
+	SoftDeleteRetentionDays int    `yaml:"soft_delete_retention_days"`
+}
+
+func defaultGCConfig() GCConfig {
+	return GCConfig{
+		GCMode:                  "automatic",
+		UnusedThresholdDays:     90,
+		SoftDeleteRetentionDays: 30,
+	}
+}
+
+func loadGCConfig(dataDir string) GCConfig {
+	cfg := defaultGCConfig()
+
+	data, err := os.ReadFile(filepath.Join(dataDir, "config.yaml"))
+	if err != nil {
+		return cfg
+	}
+
+	var loaded struct {
+		GC GCConfig `yaml:"gc"`
+	}
+	if err := yaml.Unmarshal(data, &loaded); err != nil {
+		return cfg
+	}
+
+	if loaded.GC.GCMode != "" {
+		cfg.GCMode = loaded.GC.GCMode
+	}
+	if loaded.GC.UnusedThresholdDays != 0 {
+		cfg.UnusedThresholdDays = loaded.GC.UnusedThresholdDays
+	}
+	if loaded.GC.SoftDeleteRetentionDays != 0 {
+		cfg.SoftDeleteRetentionDays = loaded.GC.SoftDeleteRetentionDays
+	}
+	return cfg
+}
+
+// GCResult is returned by RunGC with counts of each cleanup step.
+type GCResult struct {
+	DeadMutationsAcked     int  `json:"dead_mutations_acked"`
+	SoftDeletedHardDeleted int  `json:"soft_deleted_hard_deleted"`
+	AutoSoftDeleted        int  `json:"auto_soft_deleted,omitempty"`
+	Vacuumed               bool `json:"vacuumed"`
+	DryRun                 bool `json:"dry_run"`
+}
+
 // ─── Store ───────────────────────────────────────────────────────────────────
 
 type Store struct {
-	db    *sql.DB
-	cfg   Config
-	hooks storeHooks
+	db       *sql.DB
+	cfg      Config
+	gcConfig GCConfig
+	hooks    storeHooks
 }
 
 type execer interface {
@@ -427,11 +485,156 @@ func New(cfg Config) (*Store, error) {
 		return nil, fmt.Errorf("engram: repair enrolled sync journal: %w", err)
 	}
 
+	s.gcConfig = loadGCConfig(cfg.DataDir)
+	if s.gcConfig.GCMode == "automatic" {
+		result, err := s.RunGC(false)
+		if err != nil {
+			log.Printf("engram: gc at startup: %v", err)
+		} else {
+			log.Printf("engram: gc complete — acked %d dead mutations, hard-deleted %d, auto-soft-deleted %d, vacuumed: %v",
+				result.DeadMutationsAcked, result.SoftDeletedHardDeleted, result.AutoSoftDeleted, result.Vacuumed)
+		}
+	}
+
 	return s, nil
 }
 
 func (s *Store) Close() error {
 	return s.db.Close()
+}
+
+// ─── Garbage Collection ──────────────────────────────────────────────────────
+
+// ackDeadMutations marks unacked sync_mutations for non-enrolled projects as acked.
+func (s *Store) ackDeadMutations() (int, error) {
+	res, err := s.execHook(s.db, `
+		UPDATE sync_mutations
+		SET acked_at = datetime('now')
+		WHERE acked_at IS NULL
+		  AND project != ''
+		  AND project NOT IN (SELECT project FROM sync_enrolled_projects)
+	`)
+	if err != nil {
+		return 0, fmt.Errorf("ack dead mutations: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	return int(n), nil
+}
+
+// hardDeleteStaleSoftDeletes removes observations soft-deleted longer than retentionDays ago.
+func (s *Store) hardDeleteStaleSoftDeletes(retentionDays int) (int, error) {
+	res, err := s.execHook(s.db, `
+		DELETE FROM observations
+		WHERE deleted_at IS NOT NULL
+		  AND deleted_at < datetime('now', '-' || ? || ' days')
+	`, retentionDays)
+	if err != nil {
+		return 0, fmt.Errorf("hard delete stale soft-deletes: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	return int(n), nil
+}
+
+// autoSoftDelete marks observations as soft-deleted when they have zero access
+// and are older than thresholdDays. Topic key observations are exempt.
+func (s *Store) autoSoftDelete(thresholdDays int) (int, error) {
+	res, err := s.execHook(s.db, `
+		UPDATE observations
+		SET deleted_at = datetime('now')
+		WHERE deleted_at IS NULL
+		  AND access_count = 0
+		  AND topic_key IS NULL
+		  AND created_at < datetime('now', '-' || ? || ' days')
+	`, thresholdDays)
+	if err != nil {
+		return 0, fmt.Errorf("auto soft-delete: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	return int(n), nil
+}
+
+// RunGC orchestrates garbage collection. In dry-run mode it counts candidates
+// without modifying data.
+func (s *Store) RunGC(dryRun bool) (*GCResult, error) {
+	if dryRun {
+		return s.runGCDryRun()
+	}
+
+	result := &GCResult{}
+
+	acked, err := s.ackDeadMutations()
+	if err != nil {
+		return nil, err
+	}
+	result.DeadMutationsAcked = acked
+
+	hardDeleted, err := s.hardDeleteStaleSoftDeletes(s.gcConfig.SoftDeleteRetentionDays)
+	if err != nil {
+		return nil, err
+	}
+	result.SoftDeletedHardDeleted = hardDeleted
+
+	if s.gcConfig.GCMode == "automatic" {
+		autoDeleted, err := s.autoSoftDelete(s.gcConfig.UnusedThresholdDays)
+		if err != nil {
+			return nil, err
+		}
+		result.AutoSoftDeleted = autoDeleted
+	}
+
+	if _, err := s.db.Exec("VACUUM"); err != nil {
+		return nil, fmt.Errorf("vacuum: %w", err)
+	}
+	result.Vacuumed = true
+
+	return result, nil
+}
+
+func (s *Store) runGCDryRun() (*GCResult, error) {
+	result := &GCResult{DryRun: true}
+
+	// Count dead mutations
+	var deadMutations int
+	err := s.db.QueryRow(`
+		SELECT COUNT(*) FROM sync_mutations
+		WHERE acked_at IS NULL
+		  AND project != ''
+		  AND project NOT IN (SELECT project FROM sync_enrolled_projects)
+	`).Scan(&deadMutations)
+	if err != nil {
+		return nil, fmt.Errorf("dry-run count dead mutations: %w", err)
+	}
+	result.DeadMutationsAcked = deadMutations
+
+	// Count stale soft-deletes
+	var staleSoftDeletes int
+	err = s.db.QueryRow(`
+		SELECT COUNT(*) FROM observations
+		WHERE deleted_at IS NOT NULL
+		  AND deleted_at < datetime('now', '-' || ? || ' days')
+	`, s.gcConfig.SoftDeleteRetentionDays).Scan(&staleSoftDeletes)
+	if err != nil {
+		return nil, fmt.Errorf("dry-run count stale soft-deletes: %w", err)
+	}
+	result.SoftDeletedHardDeleted = staleSoftDeletes
+
+	// Count auto soft-delete candidates (automatic mode only)
+	if s.gcConfig.GCMode == "automatic" {
+		var autoCandidates int
+		err = s.db.QueryRow(`
+			SELECT COUNT(*) FROM observations
+			WHERE deleted_at IS NULL
+			  AND access_count = 0
+			  AND topic_key IS NULL
+			  AND created_at < datetime('now', '-' || ? || ' days')
+		`, s.gcConfig.UnusedThresholdDays).Scan(&autoCandidates)
+		if err != nil {
+			return nil, fmt.Errorf("dry-run count auto soft-delete candidates: %w", err)
+		}
+		result.AutoSoftDeleted = autoCandidates
+	}
+
+	return result, nil
 }
 
 // ─── Migrations ──────────────────────────────────────────────────────────────
@@ -554,6 +757,8 @@ func (s *Store) migrate() error {
 		{name: "last_seen_at", definition: "TEXT"},
 		{name: "updated_at", definition: "TEXT NOT NULL DEFAULT ''"},
 		{name: "deleted_at", definition: "TEXT"},
+		{name: "access_count", definition: "INTEGER NOT NULL DEFAULT 0"},
+		{name: "last_accessed_at", definition: "TEXT"},
 	}
 	for _, c := range observationColumns {
 		if err := s.addColumnIfNotExists("observations", c.name, c.definition); err != nil {
@@ -578,6 +783,7 @@ func (s *Store) migrate() error {
 		CREATE INDEX IF NOT EXISTS idx_prompts_sync_id ON user_prompts(sync_id);
 		CREATE INDEX IF NOT EXISTS idx_sync_mutations_target_seq ON sync_mutations(target_key, seq);
 		CREATE INDEX IF NOT EXISTS idx_sync_mutations_pending ON sync_mutations(target_key, acked_at, seq);
+		CREATE INDEX IF NOT EXISTS idx_obs_access ON observations(deleted_at, access_count, created_at);
 	`); err != nil {
 		return err
 	}
@@ -899,7 +1105,7 @@ func (s *Store) AllObservations(project, scope string, limit int) ([]Observation
 
 	query := `
 		SELECT o.id, ifnull(o.sync_id, '') as sync_id, o.session_id, o.type, o.title, o.content, o.tool_name, o.project,
-		       o.scope, o.topic_key, o.revision_count, o.duplicate_count, o.last_seen_at, o.created_at, o.updated_at, o.deleted_at
+		       o.scope, o.topic_key, o.revision_count, o.duplicate_count, o.last_seen_at, o.access_count, o.last_accessed_at, o.created_at, o.updated_at, o.deleted_at
 		FROM observations o
 		WHERE o.deleted_at IS NULL
 	`
@@ -928,7 +1134,7 @@ func (s *Store) SessionObservations(sessionID string, limit int) ([]Observation,
 
 	query := `
 		SELECT id, ifnull(sync_id, '') as sync_id, session_id, type, title, content, tool_name, project,
-		       scope, topic_key, revision_count, duplicate_count, last_seen_at, created_at, updated_at, deleted_at
+		       scope, topic_key, revision_count, duplicate_count, last_seen_at, access_count, last_accessed_at, created_at, updated_at, deleted_at
 		FROM observations
 		WHERE session_id = ? AND deleted_at IS NULL
 		ORDER BY created_at ASC
@@ -1071,7 +1277,7 @@ func (s *Store) RecentObservations(project, scope string, limit int) ([]Observat
 
 	query := `
 		SELECT o.id, ifnull(o.sync_id, '') as sync_id, o.session_id, o.type, o.title, o.content, o.tool_name, o.project,
-		       o.scope, o.topic_key, o.revision_count, o.duplicate_count, o.last_seen_at, o.created_at, o.updated_at, o.deleted_at
+		       o.scope, o.topic_key, o.revision_count, o.duplicate_count, o.last_seen_at, o.access_count, o.last_accessed_at, o.created_at, o.updated_at, o.deleted_at
 		FROM observations o
 		WHERE o.deleted_at IS NULL
 	`
@@ -1205,13 +1411,14 @@ func (s *Store) SearchPrompts(query string, project string, limit int) ([]Prompt
 func (s *Store) GetObservation(id int64) (*Observation, error) {
 	row := s.db.QueryRow(
 		`SELECT id, ifnull(sync_id, '') as sync_id, session_id, type, title, content, tool_name, project,
-		        scope, topic_key, revision_count, duplicate_count, last_seen_at, created_at, updated_at, deleted_at
+		        scope, topic_key, revision_count, duplicate_count, last_seen_at, access_count, last_accessed_at, created_at, updated_at, deleted_at
 		 FROM observations WHERE id = ? AND deleted_at IS NULL`, id,
 	)
 	var o Observation
 	if err := row.Scan(
 		&o.ID, &o.SyncID, &o.SessionID, &o.Type, &o.Title, &o.Content,
 		&o.ToolName, &o.Project, &o.Scope, &o.TopicKey, &o.RevisionCount, &o.DuplicateCount, &o.LastSeenAt,
+		&o.AccessCount, &o.LastAccessedAt,
 		&o.CreatedAt, &o.UpdatedAt, &o.DeletedAt,
 	); err != nil {
 		return nil, err
@@ -1454,7 +1661,7 @@ func (s *Store) Search(query string, opts SearchOptions) ([]SearchResult, error)
 	if strings.Contains(query, "/") {
 		tkSQL := `
 			SELECT id, ifnull(sync_id, '') as sync_id, session_id, type, title, content, tool_name, project,
-			       scope, topic_key, revision_count, duplicate_count, last_seen_at, created_at, updated_at, deleted_at
+			       scope, topic_key, revision_count, duplicate_count, last_seen_at, access_count, last_accessed_at, created_at, updated_at, deleted_at
 			FROM observations
 			WHERE topic_key = ? AND deleted_at IS NULL
 		`
@@ -1484,7 +1691,8 @@ func (s *Store) Search(query string, opts SearchOptions) ([]SearchResult, error)
 				if err := tkRows.Scan(
 					&sr.ID, &sr.SyncID, &sr.SessionID, &sr.Type, &sr.Title, &sr.Content,
 					&sr.ToolName, &sr.Project, &sr.Scope, &sr.TopicKey, &sr.RevisionCount, &sr.DuplicateCount,
-					&sr.LastSeenAt, &sr.CreatedAt, &sr.UpdatedAt, &sr.DeletedAt,
+					&sr.LastSeenAt, &sr.AccessCount, &sr.LastAccessedAt,
+					&sr.CreatedAt, &sr.UpdatedAt, &sr.DeletedAt,
 				); err != nil {
 					break
 				}
@@ -1499,7 +1707,7 @@ func (s *Store) Search(query string, opts SearchOptions) ([]SearchResult, error)
 
 	sqlQ := `
 		SELECT o.id, ifnull(o.sync_id, '') as sync_id, o.session_id, o.type, o.title, o.content, o.tool_name, o.project,
-		       o.scope, o.topic_key, o.revision_count, o.duplicate_count, o.last_seen_at, o.created_at, o.updated_at, o.deleted_at,
+		       o.scope, o.topic_key, o.revision_count, o.duplicate_count, o.last_seen_at, o.access_count, o.last_accessed_at, o.created_at, o.updated_at, o.deleted_at,
 		       fts.rank
 		FROM observations_fts fts
 		JOIN observations o ON o.id = fts.rowid
@@ -1543,7 +1751,8 @@ func (s *Store) Search(query string, opts SearchOptions) ([]SearchResult, error)
 		if err := rows.Scan(
 			&sr.ID, &sr.SyncID, &sr.SessionID, &sr.Type, &sr.Title, &sr.Content,
 			&sr.ToolName, &sr.Project, &sr.Scope, &sr.TopicKey, &sr.RevisionCount, &sr.DuplicateCount,
-			&sr.LastSeenAt, &sr.CreatedAt, &sr.UpdatedAt, &sr.DeletedAt,
+			&sr.LastSeenAt, &sr.AccessCount, &sr.LastAccessedAt,
+			&sr.CreatedAt, &sr.UpdatedAt, &sr.DeletedAt,
 			&sr.Rank,
 		); err != nil {
 			return nil, err
@@ -1675,7 +1884,7 @@ func (s *Store) Export() (*ExportData, error) {
 	// Observations
 	obsRows, err := s.queryItHook(s.db,
 		`SELECT id, ifnull(sync_id, '') as sync_id, session_id, type, title, content, tool_name, project,
-		        scope, topic_key, revision_count, duplicate_count, last_seen_at, created_at, updated_at, deleted_at
+		        scope, topic_key, revision_count, duplicate_count, last_seen_at, access_count, last_accessed_at, created_at, updated_at, deleted_at
 		 FROM observations ORDER BY id`,
 	)
 	if err != nil {
@@ -1687,6 +1896,7 @@ func (s *Store) Export() (*ExportData, error) {
 		if err := obsRows.Scan(
 			&o.ID, &o.SyncID, &o.SessionID, &o.Type, &o.Title, &o.Content,
 			&o.ToolName, &o.Project, &o.Scope, &o.TopicKey, &o.RevisionCount, &o.DuplicateCount, &o.LastSeenAt,
+			&o.AccessCount, &o.LastAccessedAt,
 			&o.CreatedAt, &o.UpdatedAt, &o.DeletedAt,
 		); err != nil {
 			return nil, err
@@ -2100,12 +2310,12 @@ func (s *Store) ApplyPulledMutation(targetKey string, mutation SyncMutation) err
 func (s *Store) GetObservationBySyncID(syncID string) (*Observation, error) {
 	row := s.db.QueryRow(
 		`SELECT id, ifnull(sync_id, '') as sync_id, session_id, type, title, content, tool_name, project,
-		        scope, topic_key, revision_count, duplicate_count, last_seen_at, created_at, updated_at, deleted_at
+		        scope, topic_key, revision_count, duplicate_count, last_seen_at, access_count, last_accessed_at, created_at, updated_at, deleted_at
 		 FROM observations WHERE sync_id = ? AND deleted_at IS NULL ORDER BY id DESC LIMIT 1`,
 		syncID,
 	)
 	var o Observation
-	if err := row.Scan(&o.ID, &o.SyncID, &o.SessionID, &o.Type, &o.Title, &o.Content, &o.ToolName, &o.Project, &o.Scope, &o.TopicKey, &o.RevisionCount, &o.DuplicateCount, &o.LastSeenAt, &o.CreatedAt, &o.UpdatedAt, &o.DeletedAt); err != nil {
+	if err := row.Scan(&o.ID, &o.SyncID, &o.SessionID, &o.Type, &o.Title, &o.Content, &o.ToolName, &o.Project, &o.Scope, &o.TopicKey, &o.RevisionCount, &o.DuplicateCount, &o.LastSeenAt, &o.AccessCount, &o.LastAccessedAt, &o.CreatedAt, &o.UpdatedAt, &o.DeletedAt); err != nil {
 		return nil, err
 	}
 	return &o, nil
@@ -2539,11 +2749,11 @@ func decodeSyncPayload(payload []byte, dest any) error {
 func (s *Store) getObservationTx(tx *sql.Tx, id int64) (*Observation, error) {
 	row := tx.QueryRow(
 		`SELECT id, ifnull(sync_id, '') as sync_id, session_id, type, title, content, tool_name, project,
-		        scope, topic_key, revision_count, duplicate_count, last_seen_at, created_at, updated_at, deleted_at
+		        scope, topic_key, revision_count, duplicate_count, last_seen_at, access_count, last_accessed_at, created_at, updated_at, deleted_at
 		 FROM observations WHERE id = ? AND deleted_at IS NULL`, id,
 	)
 	var o Observation
-	if err := row.Scan(&o.ID, &o.SyncID, &o.SessionID, &o.Type, &o.Title, &o.Content, &o.ToolName, &o.Project, &o.Scope, &o.TopicKey, &o.RevisionCount, &o.DuplicateCount, &o.LastSeenAt, &o.CreatedAt, &o.UpdatedAt, &o.DeletedAt); err != nil {
+	if err := row.Scan(&o.ID, &o.SyncID, &o.SessionID, &o.Type, &o.Title, &o.Content, &o.ToolName, &o.Project, &o.Scope, &o.TopicKey, &o.RevisionCount, &o.DuplicateCount, &o.LastSeenAt, &o.AccessCount, &o.LastAccessedAt, &o.CreatedAt, &o.UpdatedAt, &o.DeletedAt); err != nil {
 		return nil, err
 	}
 	return &o, nil
@@ -2551,7 +2761,7 @@ func (s *Store) getObservationTx(tx *sql.Tx, id int64) (*Observation, error) {
 
 func (s *Store) getObservationBySyncIDTx(tx *sql.Tx, syncID string, includeDeleted bool) (*Observation, error) {
 	query := `SELECT id, ifnull(sync_id, '') as sync_id, session_id, type, title, content, tool_name, project,
-		        scope, topic_key, revision_count, duplicate_count, last_seen_at, created_at, updated_at, deleted_at
+		        scope, topic_key, revision_count, duplicate_count, last_seen_at, access_count, last_accessed_at, created_at, updated_at, deleted_at
 		 FROM observations WHERE sync_id = ?`
 	if !includeDeleted {
 		query += ` AND deleted_at IS NULL`
@@ -2559,7 +2769,7 @@ func (s *Store) getObservationBySyncIDTx(tx *sql.Tx, syncID string, includeDelet
 	query += ` ORDER BY id DESC LIMIT 1`
 	row := tx.QueryRow(query, syncID)
 	var o Observation
-	if err := row.Scan(&o.ID, &o.SyncID, &o.SessionID, &o.Type, &o.Title, &o.Content, &o.ToolName, &o.Project, &o.Scope, &o.TopicKey, &o.RevisionCount, &o.DuplicateCount, &o.LastSeenAt, &o.CreatedAt, &o.UpdatedAt, &o.DeletedAt); err != nil {
+	if err := row.Scan(&o.ID, &o.SyncID, &o.SessionID, &o.Type, &o.Title, &o.Content, &o.ToolName, &o.Project, &o.Scope, &o.TopicKey, &o.RevisionCount, &o.DuplicateCount, &o.LastSeenAt, &o.AccessCount, &o.LastAccessedAt, &o.CreatedAt, &o.UpdatedAt, &o.DeletedAt); err != nil {
 		return nil, err
 	}
 	return &o, nil
@@ -2672,6 +2882,7 @@ func (s *Store) queryObservations(query string, args ...any) ([]Observation, err
 		if err := rows.Scan(
 			&o.ID, &o.SyncID, &o.SessionID, &o.Type, &o.Title, &o.Content,
 			&o.ToolName, &o.Project, &o.Scope, &o.TopicKey, &o.RevisionCount, &o.DuplicateCount, &o.LastSeenAt,
+			&o.AccessCount, &o.LastAccessedAt,
 			&o.CreatedAt, &o.UpdatedAt, &o.DeletedAt,
 		); err != nil {
 			return nil, err
@@ -2763,6 +2974,8 @@ func (s *Store) migrateLegacyObservationsTable() error {
 			revision_count INTEGER NOT NULL DEFAULT 1,
 			duplicate_count INTEGER NOT NULL DEFAULT 1,
 			last_seen_at TEXT,
+			access_count INTEGER NOT NULL DEFAULT 0,
+			last_accessed_at TEXT,
 			created_at TEXT    NOT NULL DEFAULT (datetime('now')),
 			updated_at TEXT    NOT NULL DEFAULT (datetime('now')),
 			deleted_at TEXT,

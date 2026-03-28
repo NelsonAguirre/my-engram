@@ -4005,3 +4005,504 @@ func TestMigrateProjectIdempotent(t *testing.T) {
 		t.Fatal("second migration should be a no-op")
 	}
 }
+
+// ─── Phase 1: GC Infrastructure Tests ────────────────────────────────────────
+
+// T1.1: access_count and last_accessed_at columns exist after migration
+func TestMigrationAddsAccessTrackingColumns(t *testing.T) {
+	s := newTestStore(t)
+
+	cols := make(map[string]string) // name -> type
+	rows, err := s.db.Query("PRAGMA table_info(observations)")
+	if err != nil {
+		t.Fatalf("PRAGMA table_info: %v", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid int
+		var name, typ string
+		var notNull, pk int
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &defaultValue, &pk); err != nil {
+			t.Fatalf("scan column: %v", err)
+		}
+		cols[name] = typ
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate columns: %v", err)
+	}
+
+	acType, ok := cols["access_count"]
+	if !ok {
+		t.Fatal("access_count column not found")
+	}
+	if acType != "INTEGER" {
+		t.Fatalf("access_count type = %q, want INTEGER", acType)
+	}
+
+	laType, ok := cols["last_accessed_at"]
+	if !ok {
+		t.Fatal("last_accessed_at column not found")
+	}
+	if laType != "TEXT" {
+		t.Fatalf("last_accessed_at type = %q, want TEXT", laType)
+	}
+}
+
+// T1.2: idx_obs_access index exists after migration
+func TestMigrationAddsAccessIndex(t *testing.T) {
+	s := newTestStore(t)
+
+	var indexName string
+	err := s.db.QueryRow(
+		"SELECT name FROM sqlite_master WHERE type='index' AND name='idx_obs_access'",
+	).Scan(&indexName)
+	if err != nil {
+		t.Fatalf("query idx_obs_access: %v", err)
+	}
+	if indexName != "idx_obs_access" {
+		t.Fatalf("expected idx_obs_access, got %q", indexName)
+	}
+}
+
+// T1.3: defaultGCConfig returns expected values
+func TestDefaultGCConfig(t *testing.T) {
+	cfg := defaultGCConfig()
+	if cfg.GCMode != "automatic" {
+		t.Fatalf("GCMode = %q, want automatic", cfg.GCMode)
+	}
+	if cfg.UnusedThresholdDays != 90 {
+		t.Fatalf("UnusedThresholdDays = %d, want 90", cfg.UnusedThresholdDays)
+	}
+	if cfg.SoftDeleteRetentionDays != 30 {
+		t.Fatalf("SoftDeleteRetentionDays = %d, want 30", cfg.SoftDeleteRetentionDays)
+	}
+}
+
+// T1.4: loadGCConfig tests
+func TestLoadGCConfigNoFile(t *testing.T) {
+	dir := t.TempDir()
+	cfg := loadGCConfig(dir)
+	if cfg.GCMode != "automatic" {
+		t.Fatalf("GCMode = %q, want automatic", cfg.GCMode)
+	}
+	if cfg.UnusedThresholdDays != 90 {
+		t.Fatalf("UnusedThresholdDays = %d, want 90", cfg.UnusedThresholdDays)
+	}
+}
+
+func TestLoadGCConfigPartialFile(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "config.yaml"), []byte("gc:\n  gc_mode: hybrid\n"), 0644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	cfg := loadGCConfig(dir)
+	if cfg.GCMode != "hybrid" {
+		t.Fatalf("GCMode = %q, want hybrid", cfg.GCMode)
+	}
+	if cfg.UnusedThresholdDays != 90 {
+		t.Fatalf("UnusedThresholdDays = %d, want 90 (default)", cfg.UnusedThresholdDays)
+	}
+	if cfg.SoftDeleteRetentionDays != 30 {
+		t.Fatalf("SoftDeleteRetentionDays = %d, want 30 (default)", cfg.SoftDeleteRetentionDays)
+	}
+}
+
+func TestLoadGCConfigFullFile(t *testing.T) {
+	dir := t.TempDir()
+	content := "gc:\n  gc_mode: hybrid\n  unused_threshold_days: 60\n  soft_delete_retention_days: 14\n"
+	if err := os.WriteFile(filepath.Join(dir, "config.yaml"), []byte(content), 0644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	cfg := loadGCConfig(dir)
+	if cfg.GCMode != "hybrid" {
+		t.Fatalf("GCMode = %q, want hybrid", cfg.GCMode)
+	}
+	if cfg.UnusedThresholdDays != 60 {
+		t.Fatalf("UnusedThresholdDays = %d, want 60", cfg.UnusedThresholdDays)
+	}
+	if cfg.SoftDeleteRetentionDays != 14 {
+		t.Fatalf("SoftDeleteRetentionDays = %d, want 14", cfg.SoftDeleteRetentionDays)
+	}
+}
+
+func TestLoadGCConfigMalformedFile(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "config.yaml"), []byte("{{invalid yaml"), 0644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	cfg := loadGCConfig(dir)
+	if cfg.GCMode != "automatic" {
+		t.Fatalf("GCMode = %q, want automatic (defaults on error)", cfg.GCMode)
+	}
+}
+
+// T1.5: ackDeadMutations acks non-enrolled mutations, leaves enrolled alone
+func TestAckDeadMutations(t *testing.T) {
+	s := newTestStore(t)
+
+	// Create enrolled project
+	if err := s.EnrollProject("enrolled-proj"); err != nil {
+		t.Fatalf("enroll project: %v", err)
+	}
+
+	// Create session and observation for dead project
+	if err := s.CreateSession("s1", "dead-proj", "/tmp/dead"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	_, err := s.AddObservation(AddObservationParams{
+		SessionID: "s1",
+		Type:      "decision",
+		Title:     "Dead project obs",
+		Content:   "content",
+		Project:   "dead-proj",
+		Scope:     "project",
+	})
+	if err != nil {
+		t.Fatalf("add observation: %v", err)
+	}
+
+	// Create session and observation for enrolled project
+	if err := s.CreateSession("s2", "enrolled-proj", "/tmp/enrolled"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	_, err = s.AddObservation(AddObservationParams{
+		SessionID: "s2",
+		Type:      "decision",
+		Title:     "Enrolled project obs",
+		Content:   "content",
+		Project:   "enrolled-proj",
+		Scope:     "project",
+	})
+	if err != nil {
+		t.Fatalf("add observation: %v", err)
+	}
+
+	// Both mutations should be unacked
+	pending, err := s.ListPendingSyncMutations(DefaultSyncTargetKey, 10)
+	if err != nil {
+		t.Fatalf("list pending: %v", err)
+	}
+	if len(pending) != 2 {
+		t.Fatalf("expected 2 pending mutations, got %d", len(pending))
+	}
+
+	// Ack dead mutations
+	count, err := s.ackDeadMutations()
+	if err != nil {
+		t.Fatalf("ackDeadMutations: %v", err)
+	}
+	// 2 dead mutations: 1 session + 1 observation for dead-proj
+	if count != 2 {
+		t.Fatalf("expected 2 acked, got %d", count)
+	}
+
+	// Only enrolled project mutations should remain pending
+	pending, err = s.ListPendingSyncMutations(DefaultSyncTargetKey, 10)
+	if err != nil {
+		t.Fatalf("list pending after ack: %v", err)
+	}
+	if len(pending) != 2 {
+		t.Fatalf("expected 2 pending mutations, got %d", len(pending))
+	}
+	for _, m := range pending {
+		if m.Project != "enrolled-proj" {
+			t.Fatalf("expected enrolled-proj mutation, got %q", m.Project)
+		}
+	}
+}
+
+// T1.6: hardDeleteStaleSoftDeletes removes old soft-deleted observations
+func TestHardDeleteStaleSoftDeletes(t *testing.T) {
+	s := newTestStore(t)
+
+	if err := s.CreateSession("s1", "proj", "/tmp/proj"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	// Create observation and soft-delete it
+	obsID, err := s.AddObservation(AddObservationParams{
+		SessionID: "s1",
+		Type:      "decision",
+		Title:     "To be hard-deleted",
+		Content:   "content",
+		Project:   "proj",
+		Scope:     "project",
+	})
+	if err != nil {
+		t.Fatalf("add observation: %v", err)
+	}
+	if err := s.DeleteObservation(obsID, false); err != nil {
+		t.Fatalf("delete observation: %v", err)
+	}
+
+	// Create another observation, soft-delete it (will remain, not old enough)
+	obsID2, err := s.AddObservation(AddObservationParams{
+		SessionID: "s1",
+		Type:      "decision",
+		Title:     "Recent soft-delete",
+		Content:   "content",
+		Project:   "proj",
+		Scope:     "project",
+	})
+	if err != nil {
+		t.Fatalf("add second observation: %v", err)
+	}
+	if err := s.DeleteObservation(obsID2, false); err != nil {
+		t.Fatalf("delete second observation: %v", err)
+	}
+
+	// Artificially age the first observation's deleted_at
+	_, err = s.db.Exec("UPDATE observations SET deleted_at = datetime('now', '-60 days') WHERE id = ?", obsID)
+	if err != nil {
+		t.Fatalf("age observation: %v", err)
+	}
+
+	// Hard-delete with 30-day retention
+	count, err := s.hardDeleteStaleSoftDeletes(30)
+	if err != nil {
+		t.Fatalf("hardDeleteStaleSoftDeletes: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("expected 1 hard-deleted, got %d", count)
+	}
+
+	// Verify first observation is gone
+	var exists int
+	err = s.db.QueryRow("SELECT COUNT(*) FROM observations WHERE id = ?", obsID).Scan(&exists)
+	if err != nil {
+		t.Fatalf("query deleted: %v", err)
+	}
+	if exists != 0 {
+		t.Fatal("expected stale observation to be hard-deleted")
+	}
+
+	// Verify second observation survives
+	err = s.db.QueryRow("SELECT COUNT(*) FROM observations WHERE id = ?", obsID2).Scan(&exists)
+	if err != nil {
+		t.Fatalf("query surviving: %v", err)
+	}
+	if exists != 1 {
+		t.Fatal("expected recent soft-deleted observation to survive")
+	}
+}
+
+// T1.7: RunGC orchestrates cleanup
+func TestRunGCIntegration(t *testing.T) {
+	s := newTestStore(t)
+
+	// Set up enrolled project with dead mutation-free state
+	if err := s.EnrollProject("enrolled"); err != nil {
+		t.Fatalf("enroll: %v", err)
+	}
+
+	// Create dead mutation (non-enrolled project)
+	if err := s.CreateSession("s1", "dead", "/tmp/dead"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	_, err := s.AddObservation(AddObservationParams{
+		SessionID: "s1",
+		Type:      "decision",
+		Title:     "Dead project obs",
+		Content:   "content",
+		Project:   "dead",
+		Scope:     "project",
+	})
+	if err != nil {
+		t.Fatalf("add observation: %v", err)
+	}
+
+	// Create stale soft-deleted observation
+	if err := s.CreateSession("s2", "enrolled", "/tmp/enrolled"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	obsID, err := s.AddObservation(AddObservationParams{
+		SessionID: "s2",
+		Type:      "decision",
+		Title:     "Stale soft-delete",
+		Content:   "content",
+		Project:   "enrolled",
+		Scope:     "project",
+	})
+	if err != nil {
+		t.Fatalf("add observation: %v", err)
+	}
+	if err := s.DeleteObservation(obsID, false); err != nil {
+		t.Fatalf("soft-delete: %v", err)
+	}
+	_, err = s.db.Exec("UPDATE observations SET deleted_at = datetime('now', '-60 days') WHERE id = ?", obsID)
+	if err != nil {
+		t.Fatalf("age observation: %v", err)
+	}
+
+	// --- Dry run ---
+	dryResult, err := s.RunGC(true)
+	if err != nil {
+		t.Fatalf("RunGC dry-run: %v", err)
+	}
+	if !dryResult.DryRun {
+		t.Fatal("expected DryRun=true")
+	}
+	// 2 dead mutations: 1 session + 1 observation for "dead" project
+	if dryResult.DeadMutationsAcked != 2 {
+		t.Fatalf("dry-run DeadMutationsAcked = %d, want 2", dryResult.DeadMutationsAcked)
+	}
+	if dryResult.SoftDeletedHardDeleted != 1 {
+		t.Fatalf("dry-run SoftDeletedHardDeleted = %d, want 1", dryResult.SoftDeletedHardDeleted)
+	}
+
+	// Verify data unchanged after dry run
+	var pendingBefore int
+	err = s.db.QueryRow("SELECT COUNT(*) FROM sync_mutations WHERE acked_at IS NULL").Scan(&pendingBefore)
+	if err != nil {
+		t.Fatalf("count pending: %v", err)
+	}
+	// 5 pending: 2 dead (session+obs) + 3 enrolled (session+obs+soft-delete)
+	if pendingBefore != 5 {
+		t.Fatalf("expected 5 pending after dry-run, got %d", pendingBefore)
+	}
+
+	// --- Actual run ---
+	result, err := s.RunGC(false)
+	if err != nil {
+		t.Fatalf("RunGC: %v", err)
+	}
+	if result.DryRun {
+		t.Fatal("expected DryRun=false")
+	}
+	if result.DeadMutationsAcked != 2 {
+		t.Fatalf("DeadMutationsAcked = %d, want 2", result.DeadMutationsAcked)
+	}
+	if result.SoftDeletedHardDeleted != 1 {
+		t.Fatalf("SoftDeletedHardDeleted = %d, want 1", result.SoftDeletedHardDeleted)
+	}
+	if !result.Vacuumed {
+		t.Fatal("expected Vacuumed=true")
+	}
+
+	// Verify data changed after actual run
+	var pendingAfter int
+	err = s.db.QueryRow("SELECT COUNT(*) FROM sync_mutations WHERE acked_at IS NULL").Scan(&pendingAfter)
+	if err != nil {
+		t.Fatalf("count pending after GC: %v", err)
+	}
+	// 3 enrolled-proj mutations remain (session + observation + soft-delete)
+	if pendingAfter != 3 {
+		t.Fatalf("expected 3 pending after GC, got %d", pendingAfter)
+	}
+
+	// Verify stale soft-delete is hard-deleted
+	var exists int
+	err = s.db.QueryRow("SELECT COUNT(*) FROM observations WHERE id = ?", obsID).Scan(&exists)
+	if err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	if exists != 0 {
+		t.Fatal("expected stale soft-deleted observation to be hard-deleted")
+	}
+}
+
+// T1.8: GC runs at startup in automatic mode
+func TestGCRunsAtStartup(t *testing.T) {
+	// Use newTestStore which has automatic mode by default
+	// The startup GC runs automatically, but there's no stale data to clean.
+	// We verify by checking that gcConfig is loaded and the store works.
+	s := newTestStore(t)
+
+	// Verify gcConfig is loaded with defaults
+	if s.gcConfig.GCMode != "automatic" {
+		t.Fatalf("GCMode = %q, want automatic", s.gcConfig.GCMode)
+	}
+
+	// Create a stale soft-deleted observation and re-init the store
+	if err := s.CreateSession("s1", "proj", "/tmp/proj"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	obsID, err := s.AddObservation(AddObservationParams{
+		SessionID: "s1",
+		Type:      "decision",
+		Title:     "Stale obs",
+		Content:   "content",
+		Project:   "proj",
+		Scope:     "project",
+	})
+	if err != nil {
+		t.Fatalf("add observation: %v", err)
+	}
+	if err := s.DeleteObservation(obsID, false); err != nil {
+		t.Fatalf("soft-delete: %v", err)
+	}
+	// Artificially age the deleted_at
+	_, err = s.db.Exec("UPDATE observations SET deleted_at = datetime('now', '-60 days') WHERE id = ?", obsID)
+	if err != nil {
+		t.Fatalf("age observation: %v", err)
+	}
+
+	// Manually call RunGC (simulating what would happen at next startup)
+	result, err := s.RunGC(false)
+	if err != nil {
+		t.Fatalf("RunGC: %v", err)
+	}
+	if result.SoftDeletedHardDeleted != 1 {
+		t.Fatalf("SoftDeletedHardDeleted = %d, want 1", result.SoftDeletedHardDeleted)
+	}
+
+	// Verify observation is gone
+	var count int
+	err = s.db.QueryRow("SELECT COUNT(*) FROM observations WHERE id = ?", obsID).Scan(&count)
+	if err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	if count != 0 {
+		t.Fatal("expected stale observation to be hard-deleted")
+	}
+}
+
+// T1.9: sync payload does NOT include access_count or last_accessed_at
+func TestSyncPayloadExcludesAccessFields(t *testing.T) {
+	s := newTestStore(t)
+
+	if err := s.CreateSession("s1", "proj", "/tmp/proj"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	obsID, err := s.AddObservation(AddObservationParams{
+		SessionID: "s1",
+		Type:      "decision",
+		Title:     "Test obs",
+		Content:   "content",
+		Project:   "proj",
+		Scope:     "project",
+	})
+	if err != nil {
+		t.Fatalf("add observation: %v", err)
+	}
+
+	// Set access_count to a high value to be sure it's excluded
+	_, err = s.db.Exec("UPDATE observations SET access_count = 5, last_accessed_at = datetime('now') WHERE id = ?", obsID)
+	if err != nil {
+		t.Fatalf("set access fields: %v", err)
+	}
+
+	obs, err := s.GetObservation(obsID)
+	if err != nil {
+		t.Fatalf("get observation: %v", err)
+	}
+	if obs.AccessCount != 5 {
+		t.Fatalf("access_count = %d, want 5", obs.AccessCount)
+	}
+
+	payload := observationPayloadFromObservation(obs)
+	data, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+
+	jsonStr := string(data)
+	if strings.Contains(jsonStr, "access_count") {
+		t.Fatal("sync payload must NOT contain access_count")
+	}
+	if strings.Contains(jsonStr, "last_accessed_at") {
+		t.Fatal("sync payload must NOT contain last_accessed_at")
+	}
+}
