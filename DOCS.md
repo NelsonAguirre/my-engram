@@ -67,7 +67,7 @@ engram/
 ### Tables
 
 - **sessions** — `id` (TEXT PK), `project`, `directory`, `started_at`, `ended_at`, `summary`, `status`
-- **observations** — `id` (INTEGER PK AUTOINCREMENT), `session_id` (FK), `type`, `title`, `content`, `tool_name`, `project`, `scope`, `topic_key`, `normalized_hash`, `revision_count`, `duplicate_count`, `last_seen_at`, `created_at`, `updated_at`, `deleted_at`
+- **observations** — `id` (INTEGER PK AUTOINCREMENT), `session_id` (FK), `type`, `title`, `content`, `tool_name`, `project`, `scope`, `topic_key`, `normalized_hash`, `revision_count`, `duplicate_count`, `last_seen_at`, `created_at`, `updated_at`, `deleted_at`, `access_count`, `last_accessed_at`
 - **observations_fts** — FTS5 virtual table synced via triggers (`title`, `content`, `tool_name`, `type`, `project`)
 - **user_prompts** — `id` (INTEGER PK AUTOINCREMENT), `session_id` (FK), `content`, `project`, `created_at`
 - **prompts_fts** — FTS5 virtual table synced via triggers (`content`, `project`)
@@ -96,6 +96,7 @@ engram stats              Show memory system statistics
 engram export [file]      Export all memories to JSON (default: engram-export.json)
 engram import <file>      Import memories from a JSON export file
 engram sync               Export new memories as chunk [--import] [--status] [--project NAME] [--all]
+engram gc [--dry-run]    Run garbage collection [--dry-run to preview]
 engram version            Print version
 engram help               Show help
 ```
@@ -245,6 +246,10 @@ All endpoints return JSON. Server listens on `127.0.0.1:7437`.
 
 - `GET /stats` — Memory statistics
 
+### Garbage Collection
+
+- `POST /gc` — Run garbage collection. Body (optional): `{"dry_run": true}`
+
 ### Sync Status
 
 
@@ -320,6 +325,13 @@ Register the start of a new coding session.
 ### mem_session_end
 
 Mark a session as completed with optional summary.
+
+### mem_gc
+
+Run garbage collection to clean up unused memories. Parameters:
+- `dry_run` (bool, optional): Preview what would be cleaned without modifying data
+
+Returns a GCResult with counts of cleaned items.
 
 ---
 
@@ -543,6 +555,32 @@ The OpenCode plugin does NOT auto-capture raw tool calls. All memory comes from 
 
 The plugin still counts tool calls per session (for session end summary stats) but doesn't persist them as observations.
 
+### 9. Garbage Collection (Access-Based Decay)
+
+Engram automatically manages memory lifecycle using access-based decay:
+
+- **Access tracking**: Every explicit retrieval via `mem_get_observation(id)` increments `access_count` and updates `last_accessed_at`. This is local-only and never synced.
+- **Automatic cleanup**: At startup, GC runs automatically and cleans up:
+  - Dead sync mutations (for non-enrolled projects)
+  - Stale soft-deletes (older than 30 days)
+  - Unused observations (0 accesses + older than threshold, in automatic mode)
+- **Modes**: `automatic` (default, full cleanup) or `hybrid` (safe cleanup only, skip auto soft-delete)
+- **Topic key exemption**: Observations with `topic_key` are exempt from auto soft-delete — they have ongoing value via upserts
+- **Safe defaults**: Soft-delete gives 30 days to recover before permanent deletion
+
+Configuration in `~/.engram/config.yaml`:
+
+```yaml
+gc_mode: automatic              # automatic | hybrid
+unused_threshold_days: 90       # days without access before auto soft-delete
+soft_delete_retention_days: 30  # days in soft-delete before hard-delete
+```
+
+Commands:
+- `engram gc --dry-run` — Preview what would be cleaned
+- `engram gc` — Run GC
+- `mem_gc` MCP tool with `dry_run` parameter
+
 ---
 
 ## OpenCode Plugin
@@ -578,7 +616,7 @@ The `tool.execute.after` hook receives:
 
 ### ENGRAM_TOOLS (excluded from tool count)
 
-`mem_search`, `mem_save`, `mem_update`, `mem_delete`, `mem_suggest_topic_key`, `mem_save_prompt`, `mem_session_summary`, `mem_context`, `mem_stats`, `mem_timeline`, `mem_get_observation`, `mem_session_start`, `mem_session_end`
+`mem_search`, `mem_save`, `mem_update`, `mem_delete`, `mem_suggest_topic_key`, `mem_save_prompt`, `mem_session_summary`, `mem_context`, `mem_stats`, `mem_timeline`, `mem_get_observation`, `mem_session_start`, `mem_session_end`, `mem_gc`
 
 ---
 

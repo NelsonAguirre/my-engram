@@ -66,6 +66,7 @@ Next session starts → Previous session context is injected automatically
 | `mem_stats` | Memory system statistics |
 | `mem_session_start` | Register a session start |
 | `mem_session_end` | Mark a session as completed |
+| `mem_gc` | Garbage collection — clean up unused memories |
 
 ---
 
@@ -90,6 +91,46 @@ Token-efficient memory retrieval — don't dump everything, drill in:
 - Topic upserts increment `revision_count` so evolving decisions stay in one memory
 - `mem_delete` uses soft-delete by default (`deleted_at`), with optional hard delete
 - `mem_search`, `mem_context`, recent lists, and timeline ignore soft-deleted observations
+
+---
+
+## Garbage Collection
+
+Engram automatically manages memory lifecycle. The GC runs at startup and cleans up:
+
+- **Dead sync mutations**: Mutations for non-enrolled projects that will never sync
+- **Stale soft-deletes**: Soft-deleted observations older than 30 days
+- **Unused memories**: Observations never explicitly accessed (in automatic mode)
+
+### Access Tracking
+
+Every explicit retrieval via `mem_get_observation(id)` increments `access_count` and updates `last_accessed_at`. This is local-only and never synced.
+
+### Configuration
+
+GC settings in `~/.engram/config.yaml`:
+
+```yaml
+gc_mode: automatic              # automatic | hybrid
+unused_threshold_days: 90       # days without access before auto soft-delete
+soft_delete_retention_days: 30  # days in soft-delete before hard-delete
+```
+
+| Mode | Behavior |
+|------|----------|
+| `automatic` | Full cleanup including auto soft-delete |
+| `hybrid` | Safe cleanup only — skips auto soft-delete |
+
+### Commands
+
+```bash
+engram gc --dry-run  # Preview what would be cleaned
+engram gc            # Run GC
+```
+
+### Topic Key Exemption
+
+Observations with `topic_key` are exempt from auto soft-delete — they have ongoing value via upserts.
 
 ---
 

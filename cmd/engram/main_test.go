@@ -639,3 +639,64 @@ func TestCmdSearchLocalMode(t *testing.T) {
 		t.Fatalf("expected local search results, got: %q", stdout)
 	}
 }
+
+func TestCmdGCDryRun(t *testing.T) {
+	cfg := testConfig(t)
+
+	withArgs(t, "engram", "gc", "--dry-run")
+	stdout, stderr := captureOutput(t, func() { cmdGC(cfg) })
+	if stderr != "" {
+		t.Fatalf("expected no stderr, got: %q", stderr)
+	}
+	if !strings.Contains(stdout, "GC dry run") {
+		t.Fatalf("expected 'GC dry run' in output, got: %q", stdout)
+	}
+	if !strings.Contains(stdout, "Dead mutations acked") {
+		t.Fatalf("expected 'Dead mutations acked' in output, got: %q", stdout)
+	}
+}
+
+func TestCmdGCInit(t *testing.T) {
+	cfg := testConfig(t)
+
+	withArgs(t, "engram", "gc", "--init")
+	stdout, stderr := captureOutput(t, func() { cmdGC(cfg) })
+	if stderr != "" {
+		t.Fatalf("expected no stderr, got: %q", stderr)
+	}
+	if !strings.Contains(stdout, "Created") {
+		t.Fatalf("expected 'Created' in output, got: %q", stdout)
+	}
+
+	configPath := filepath.Join(cfg.DataDir, "config.yaml")
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("config.yaml should exist: %v", err)
+	}
+	content := string(data)
+	if !strings.Contains(content, "gc_mode: automatic") {
+		t.Fatalf("expected gc_mode in config, got: %s", content)
+	}
+	if !strings.Contains(content, "unused_threshold_days: 90") {
+		t.Fatalf("expected unused_threshold_days in config, got: %s", content)
+	}
+	if !strings.Contains(content, "soft_delete_retention_days: 30") {
+		t.Fatalf("expected soft_delete_retention_days in config, got: %s", content)
+	}
+}
+
+func TestCmdGCActual(t *testing.T) {
+	cfg := testConfig(t)
+
+	withArgs(t, "engram", "gc")
+	stdout, stderr := captureOutput(t, func() { cmdGC(cfg) })
+	if stderr != "" {
+		t.Fatalf("expected no stderr, got: %q", stderr)
+	}
+	if !strings.Contains(stdout, "GC complete") {
+		t.Fatalf("expected 'GC complete' in output, got: %q", stdout)
+	}
+	if strings.Contains(stdout, "dry run") {
+		t.Fatalf("should not mention dry run for actual GC, got: %q", stdout)
+	}
+}

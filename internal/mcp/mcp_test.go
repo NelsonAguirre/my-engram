@@ -937,7 +937,7 @@ func TestResolveToolsAgentProfile(t *testing.T) {
 	}
 
 	// Admin-only tools should NOT be in agent profile
-	adminOnly := []string{"mem_delete", "mem_stats", "mem_timeline"}
+	adminOnly := []string{"mem_delete", "mem_stats", "mem_timeline", "mem_gc"}
 	for _, tool := range adminOnly {
 		if result[tool] {
 			t.Errorf("agent profile should NOT contain admin tool: %s", tool)
@@ -955,7 +955,7 @@ func TestResolveToolsAdminProfile(t *testing.T) {
 		t.Fatal("expected non-nil allowlist for 'admin'")
 	}
 
-	expectedTools := []string{"mem_delete", "mem_stats", "mem_timeline"}
+	expectedTools := []string{"mem_delete", "mem_stats", "mem_timeline", "mem_gc"}
 	for _, tool := range expectedTools {
 		if !result[tool] {
 			t.Errorf("admin profile missing tool: %s", tool)
@@ -973,12 +973,12 @@ func TestResolveToolsCombinedProfiles(t *testing.T) {
 		t.Fatal("expected non-nil allowlist for combined profiles")
 	}
 
-	// Should have all 14 tools
+	// Should have all 15 tools
 	allTools := []string{
 		"mem_save", "mem_search", "mem_context", "mem_session_summary",
 		"mem_session_start", "mem_session_end", "mem_get_observation",
 		"mem_suggest_topic_key", "mem_capture_passive", "mem_save_prompt",
-		"mem_update", "mem_delete", "mem_stats", "mem_timeline",
+		"mem_update", "mem_delete", "mem_stats", "mem_timeline", "mem_gc",
 	}
 	for _, tool := range allTools {
 		if !result[tool] {
@@ -1113,7 +1113,7 @@ func TestNewServerWithToolsAgentProfile(t *testing.T) {
 	}
 
 	// Admin-only tools should NOT be present
-	adminTools := []string{"mem_delete", "mem_stats", "mem_timeline"}
+	adminTools := []string{"mem_delete", "mem_stats", "mem_timeline", "mem_gc"}
 	for _, name := range adminTools {
 		if tools[name] != nil {
 			t.Errorf("agent profile: tool %q should NOT be registered", name)
@@ -1132,8 +1132,8 @@ func TestNewServerWithToolsAdminProfile(t *testing.T) {
 
 	tools := srv.ListTools()
 
-	// Admin tools should be present (3 tools)
-	adminTools := []string{"mem_delete", "mem_stats", "mem_timeline"}
+	// Admin tools should be present (4 tools)
+	adminTools := []string{"mem_delete", "mem_stats", "mem_timeline", "mem_gc"}
 	for _, name := range adminTools {
 		if tools[name] == nil {
 			t.Errorf("admin profile: expected tool %q to be registered", name)
@@ -1163,7 +1163,7 @@ func TestNewServerWithToolsNilRegistersAll(t *testing.T) {
 		"mem_save", "mem_search", "mem_context", "mem_session_summary",
 		"mem_session_start", "mem_session_end", "mem_get_observation",
 		"mem_suggest_topic_key", "mem_capture_passive", "mem_save_prompt",
-		"mem_update", "mem_delete", "mem_stats", "mem_timeline",
+		"mem_update", "mem_delete", "mem_stats", "mem_timeline", "mem_gc",
 	}
 
 	for _, name := range allTools {
@@ -1202,14 +1202,14 @@ func TestNewServerBackwardsCompatible(t *testing.T) {
 	srv := NewServer(s)
 	tools := srv.ListTools()
 
-	// 11 agent + 3 admin = 14 total
-	if len(tools) != 14 {
-		t.Errorf("NewServer should register all 14 tools, got %d", len(tools))
+	// 11 agent + 4 admin = 15 total
+	if len(tools) != 15 {
+		t.Errorf("NewServer should register all 15 tools, got %d", len(tools))
 	}
 }
 
 func TestProfileConsistency(t *testing.T) {
-	// Verify that agent + admin = all 14 tools
+	// Verify that agent + admin = all 15 tools
 	combined := make(map[string]bool)
 	for tool := range ProfileAgent {
 		combined[tool] = true
@@ -1218,8 +1218,8 @@ func TestProfileConsistency(t *testing.T) {
 		combined[tool] = true
 	}
 
-	if len(combined) != 14 {
-		t.Errorf("agent + admin should cover all 14 tools, got %d", len(combined))
+	if len(combined) != 15 {
+		t.Errorf("agent + admin should cover all 15 tools, got %d", len(combined))
 	}
 
 	// Verify no overlap between profiles
@@ -1276,7 +1276,7 @@ func TestNonCoreToolsAreDeferred(t *testing.T) {
 		"mem_update", "mem_suggest_topic_key",
 		"mem_session_start", "mem_session_end",
 		"mem_stats", "mem_delete", "mem_timeline",
-		"mem_capture_passive",
+		"mem_capture_passive", "mem_gc",
 	}
 	for _, name := range deferredTools {
 		tool := tools[name]
@@ -1503,5 +1503,51 @@ func TestDestructiveToolAnnotation(t *testing.T) {
 	}
 	if ann.ReadOnlyHint == nil || *ann.ReadOnlyHint {
 		t.Error("mem_delete should NOT be marked readOnly")
+	}
+}
+
+func TestHandleGCDryRun(t *testing.T) {
+	s := newMCPTestStore(t)
+	h := handleGC(s)
+
+	req := mcppkg.CallToolRequest{Params: mcppkg.CallToolParams{Arguments: map[string]any{
+		"dry_run": true,
+	}}}
+
+	res, err := h(context.Background(), req)
+	if err != nil {
+		t.Fatalf("handler error: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("unexpected tool error: %s", callResultText(t, res))
+	}
+
+	text := callResultText(t, res)
+	if !strings.Contains(text, `"dry_run":true`) {
+		t.Fatalf("expected dry_run=true in JSON response, got: %s", text)
+	}
+	if !strings.Contains(text, `"dead_mutations_acked"`) {
+		t.Fatalf("expected dead_mutations_acked field, got: %s", text)
+	}
+	if !strings.Contains(text, `"soft_deleted_hard_deleted"`) {
+		t.Fatalf("expected soft_deleted_hard_deleted field, got: %s", text)
+	}
+}
+
+func TestHandleGCRegistered(t *testing.T) {
+	s := newMCPTestStore(t)
+	srv := NewServer(s)
+	tools := srv.ListTools()
+
+	tool := tools["mem_gc"]
+	if tool == nil {
+		t.Fatal("mem_gc should be registered in admin profile")
+	}
+	ann := tool.Tool.Annotations
+	if ann.DestructiveHint == nil || !*ann.DestructiveHint {
+		t.Error("mem_gc should be marked destructive")
+	}
+	if ann.IdempotentHint == nil || !*ann.IdempotentHint {
+		t.Error("mem_gc should be marked idempotent")
 	}
 }

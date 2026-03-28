@@ -136,6 +136,9 @@ func (s *Server) routes() {
 
 	// Sync status (degraded-state visibility for autosync)
 	s.mux.HandleFunc("GET /sync/status", s.handleSyncStatus)
+
+	// Garbage collection
+	s.mux.HandleFunc("POST /gc", s.handleGC)
 }
 
 // ─── Handlers ────────────────────────────────────────────────────────────────
@@ -560,6 +563,29 @@ func (s *Server) handleMigrateProject(w http.ResponseWriter, r *http.Request) {
 		"sessions":     result.SessionsUpdated,
 		"prompts":      result.PromptsUpdated,
 	})
+}
+
+func (s *Server) handleGC(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		DryRun bool `json:"dry_run"`
+	}
+
+	// Body is optional — empty body means dry_run=false
+	if r.ContentLength > 0 {
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			jsonError(w, http.StatusBadRequest, "invalid JSON body")
+			return
+		}
+	}
+
+	result, err := s.store.RunGC(body.DryRun)
+	if err != nil {
+		log.Printf("[engram] gc failed: %v", err)
+		jsonError(w, http.StatusInternalServerError, "gc failed")
+		return
+	}
+
+	jsonResponse(w, http.StatusOK, result)
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────

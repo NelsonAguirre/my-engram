@@ -6,15 +6,16 @@
 //
 // Tool profiles allow agents to load only the tools they need:
 //
-//	engram mcp                    → all 14 tools (default)
+//	engram mcp                    → all 15 tools (default)
 //	engram mcp --tools=agent      → 11 tools agents actually use (per skill files)
-//	engram mcp --tools=admin      → 3 tools for TUI/CLI (delete, stats, timeline)
+//	engram mcp --tools=admin      → 4 tools for TUI/CLI (delete, stats, timeline, gc)
 //	engram mcp --tools=agent,admin → combine profiles
 //	engram mcp --tools=mem_save,mem_search → individual tool names
 package mcp
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 
@@ -37,7 +38,7 @@ var loadMCPStats = func(s *store.Store) (*store.Stats, error) {
 //   mem_suggest_topic_key, mem_capture_passive, mem_save_prompt
 //
 // "admin" — tools for manual curation, TUI, and dashboards:
-//   mem_update, mem_delete, mem_stats, mem_timeline
+//   mem_update, mem_delete, mem_stats, mem_timeline, mem_gc
 //
 // "all" (default) — every tool registered.
 
@@ -64,6 +65,7 @@ var ProfileAdmin = map[string]bool{
 	"mem_delete":   true, // only in OpenCode's ENGRAM_TOOLS filter, not in any agent instructions
 	"mem_stats":    true, // only in OpenCode's ENGRAM_TOOLS filter, not in any agent instructions
 	"mem_timeline": true, // only in OpenCode's ENGRAM_TOOLS filter, not in any agent instructions
+	"mem_gc":       true, // garbage collection — admin-only lifecycle management
 }
 
 // Profiles maps profile names to their tool sets.
@@ -126,7 +128,7 @@ CORE TOOLS (always available — use without ToolSearch):
 
 DEFERRED TOOLS (use ToolSearch when needed):
   mem_update, mem_suggest_topic_key, mem_session_start, mem_session_end,
-  mem_stats, mem_delete, mem_timeline, mem_capture_passive
+  mem_stats, mem_delete, mem_timeline, mem_capture_passive, mem_gc
 
 PROACTIVE SAVE RULE: Call mem_save immediately after ANY decision, bug fix, discovery, or convention — not just when asked.`
 
@@ -422,6 +424,25 @@ Examples:
 				),
 			),
 			handleTimeline(s),
+		)
+	}
+
+	// ─── mem_gc (profile: admin, deferred) ────────────────────────────
+	if shouldRegister("mem_gc", allowlist) {
+		srv.AddTool(
+			mcp.NewTool("mem_gc",
+				mcp.WithDescription("Run garbage collection: ack dead mutations, hard-delete stale soft-deletes, auto soft-delete unused observations (automatic mode), and VACUUM."),
+				mcp.WithDeferLoading(true),
+				mcp.WithTitleAnnotation("Garbage Collection"),
+				mcp.WithReadOnlyHintAnnotation(false),
+				mcp.WithDestructiveHintAnnotation(true),
+				mcp.WithIdempotentHintAnnotation(true),
+				mcp.WithOpenWorldHintAnnotation(false),
+				mcp.WithBoolean("dry_run",
+					mcp.Description("If true, counts candidates without modifying data (default: false)"),
+				),
+			),
+			handleGC(s),
 		)
 	}
 
@@ -841,6 +862,24 @@ func handleStats(s *store.Store) server.ToolHandlerFunc {
 			stats.TotalSessions, stats.TotalObservations, stats.TotalPrompts, projects)
 
 		return mcp.NewToolResultText(result), nil
+	}
+}
+
+func handleGC(s *store.Store) server.ToolHandlerFunc {
+	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		dryRun := boolArg(req, "dry_run", false)
+
+		result, err := s.RunGC(dryRun)
+		if err != nil {
+			return mcp.NewToolResultError("GC failed: " + err.Error()), nil
+		}
+
+		data, err := json.Marshal(result)
+		if err != nil {
+			return mcp.NewToolResultError("Failed to encode GC result: " + err.Error()), nil
+		}
+
+		return mcp.NewToolResultText(string(data)), nil
 	}
 }
 

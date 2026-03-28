@@ -69,6 +69,7 @@ var (
 	storeFormatContext = func(s *store.Store, project, scope string) (string, error) { return s.FormatContext(project, scope) }
 	storeStats         = func(s *store.Store) (*store.Stats, error) { return s.Stats() }
 	storeExport        = func(s *store.Store) (*store.ExportData, error) { return s.Export() }
+	storeGC            = func(s *store.Store, dryRun bool) (*store.GCResult, error) { return s.RunGC(dryRun) }
 	jsonMarshalIndent  = json.MarshalIndent
 
 	syncStatus = func(sy *engramsync.Syncer) (localChunks int, remoteChunks int, pendingImport int, err error) {
@@ -142,6 +143,8 @@ func main() {
 		cmdImport(cfg)
 	case "sync":
 		cmdSync(cfg)
+	case "gc":
+		cmdGC(cfg)
 	case "setup":
 		cmdSetup()
 	case "version", "--version", "-v":
@@ -690,6 +693,62 @@ func cmdSync(cfg store.Config) {
 	fmt.Printf("  git add .engram/ && git commit -m \"sync engram memories\"\n")
 }
 
+func cmdGC(cfg store.Config) {
+	dryRun := false
+	initConfig := false
+	for i := 2; i < len(os.Args); i++ {
+		switch os.Args[i] {
+		case "--dry-run":
+			dryRun = true
+		case "--init":
+			initConfig = true
+		}
+	}
+
+	if initConfig {
+		configPath := filepath.Join(cfg.DataDir, "config.yaml")
+		if err := os.MkdirAll(cfg.DataDir, 0o755); err != nil {
+			fatal(fmt.Errorf("create data dir: %w", err))
+		}
+		content := `# Engram configuration
+gc:
+  gc_mode: automatic
+  unused_threshold_days: 90
+  soft_delete_retention_days: 30
+`
+		if err := os.WriteFile(configPath, []byte(content), 0o644); err != nil {
+			fatal(fmt.Errorf("write config: %w", err))
+		}
+		fmt.Printf("Created %s\n", configPath)
+		return
+	}
+
+	s, err := storeNew(cfg)
+	if err != nil {
+		fatal(err)
+	}
+	defer s.Close()
+
+	result, err := storeGC(s, dryRun)
+	if err != nil {
+		fatal(err)
+	}
+
+	if dryRun {
+		fmt.Println("GC dry run — no changes made:")
+	} else {
+		fmt.Println("GC complete:")
+	}
+	fmt.Printf("  Dead mutations acked:  %d\n", result.DeadMutationsAcked)
+	fmt.Printf("  Hard-deleted:          %d\n", result.SoftDeletedHardDeleted)
+	if result.AutoSoftDeleted > 0 {
+		fmt.Printf("  Auto soft-deleted:     %d\n", result.AutoSoftDeleted)
+	}
+	if result.Vacuumed {
+		fmt.Println("  Vacuumed:              yes")
+	}
+}
+
 func cmdSetup() {
 	agents := setupSupportedAgents()
 
@@ -810,6 +869,9 @@ Commands:
                        --status   Show sync status (local vs remote chunks)
                        --project  Filter export to a specific project
                        --all      Export ALL projects (ignore directory-based filter)
+  gc                 Run garbage collection
+                       --dry-run  Count candidates without modifying data
+                       --init     Create default config.yaml (no store access)
 
   version            Print version
   help               Show this help

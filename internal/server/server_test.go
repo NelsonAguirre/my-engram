@@ -415,3 +415,60 @@ func TestHandleStatsReturnsInternalServerErrorOnLoaderError(t *testing.T) {
 		t.Fatalf("expected 500 stats response, got %d", rec.Code)
 	}
 }
+
+func TestHandleGCDryRun(t *testing.T) {
+	st := newServerTestStore(t)
+	srv := New(st, 0)
+	h := srv.Handler()
+
+	body := `{"dry_run": true}`
+	req := httptest.NewRequest(http.MethodPost, "/gc", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+
+	var result struct {
+		DeadMutationsAcked     int  `json:"dead_mutations_acked"`
+		SoftDeletedHardDeleted int  `json:"soft_deleted_hard_deleted"`
+		Vacuumed               bool `json:"vacuumed"`
+		DryRun                 bool `json:"dry_run"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&result); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if !result.DryRun {
+		t.Error("expected dry_run=true in response")
+	}
+	if result.Vacuumed {
+		t.Error("dry run should not vacuum")
+	}
+}
+
+func TestHandleGCNoBody(t *testing.T) {
+	st := newServerTestStore(t)
+	srv := New(st, 0)
+	h := srv.Handler()
+
+	req := httptest.NewRequest(http.MethodPost, "/gc", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 for empty body, got %d", rec.Code)
+	}
+
+	var result struct {
+		Vacuumed bool `json:"vacuumed"`
+		DryRun   bool `json:"dry_run"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&result); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if result.DryRun {
+		t.Error("empty body should default to dry_run=false")
+	}
+}

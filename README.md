@@ -85,6 +85,7 @@ Full details on session lifecycle, topic keys, and memory hygiene → [docs/ARCH
 | `mem_stats` | Memory statistics |
 | `mem_session_start` | Register session start |
 | `mem_session_end` | Mark session complete |
+| `mem_gc` | Garbage collection — clean up unused memories |
 
 Full tool reference → [docs/ARCHITECTURE.md#mcp-tools](docs/ARCHITECTURE.md#mcp-tools)
 
@@ -132,6 +133,7 @@ Full sync documentation → [DOCS.md](DOCS.md)
 | `engram export [file]` | Export to JSON |
 | `engram import <file>` | Import from JSON |
 | `engram sync` | Git sync export |
+| `engram gc [--dry-run]` | Garbage collection — --dry-run to preview |
 | `engram version` | Show version |
 
 ## Documentation
