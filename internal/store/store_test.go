@@ -4506,3 +4506,174 @@ func TestSyncPayloadExcludesAccessFields(t *testing.T) {
 		t.Fatal("sync payload must NOT contain last_accessed_at")
 	}
 }
+
+// T2.1: GetObservation bumps access_count and sets last_accessed_at
+func TestGetObservationBumpsAccessCount(t *testing.T) {
+	s := newTestStore(t)
+
+	if err := s.CreateSession("s1", "proj", "/tmp/proj"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	obsID, err := s.AddObservation(AddObservationParams{
+		SessionID: "s1",
+		Type:      "decision",
+		Title:     "Access bump test",
+		Content:   "content",
+		Project:   "proj",
+		Scope:     "project",
+	})
+	if err != nil {
+		t.Fatalf("add observation: %v", err)
+	}
+
+	// Verify initial state
+	var accessCount int
+	var lastAccessedAt *string
+	err = s.db.QueryRow("SELECT access_count, last_accessed_at FROM observations WHERE id = ?", obsID).Scan(&accessCount, &lastAccessedAt)
+	if err != nil {
+		t.Fatalf("query initial: %v", err)
+	}
+	if accessCount != 0 {
+		t.Fatalf("initial access_count = %d, want 0", accessCount)
+	}
+	if lastAccessedAt != nil {
+		t.Fatalf("initial last_accessed_at = %q, want nil", *lastAccessedAt)
+	}
+
+	// First GetObservation — should bump to 1
+	_, err = s.GetObservation(obsID)
+	if err != nil {
+		t.Fatalf("first GetObservation: %v", err)
+	}
+
+	err = s.db.QueryRow("SELECT access_count, last_accessed_at FROM observations WHERE id = ?", obsID).Scan(&accessCount, &lastAccessedAt)
+	if err != nil {
+		t.Fatalf("query after first get: %v", err)
+	}
+	if accessCount != 1 {
+		t.Fatalf("access_count after first get = %d, want 1", accessCount)
+	}
+	if lastAccessedAt == nil {
+		t.Fatal("last_accessed_at should be non-nil after first get")
+	}
+
+	// Second GetObservation — should bump to 2
+	_, err = s.GetObservation(obsID)
+	if err != nil {
+		t.Fatalf("second GetObservation: %v", err)
+	}
+
+	err = s.db.QueryRow("SELECT access_count, last_accessed_at FROM observations WHERE id = ?", obsID).Scan(&accessCount, &lastAccessedAt)
+	if err != nil {
+		t.Fatalf("query after second get: %v", err)
+	}
+	if accessCount != 2 {
+		t.Fatalf("access_count after second get = %d, want 2", accessCount)
+	}
+	if lastAccessedAt == nil {
+		t.Fatal("last_accessed_at should be non-nil after second get")
+	}
+}
+
+// T2.2: getObservationTx (used by UpdateObservation) does NOT bump access_count
+func TestGetObservationTxDoesNotBumpAccess(t *testing.T) {
+	s := newTestStore(t)
+
+	if err := s.CreateSession("s1", "proj", "/tmp/proj"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	obsID, err := s.AddObservation(AddObservationParams{
+		SessionID: "s1",
+		Type:      "decision",
+		Title:     "No bump test",
+		Content:   "original content",
+		Project:   "proj",
+		Scope:     "project",
+	})
+	if err != nil {
+		t.Fatalf("add observation: %v", err)
+	}
+
+	// UpdateObservation internally calls getObservationTx — must NOT bump
+	updated := "updated content"
+	_, err = s.UpdateObservation(obsID, UpdateObservationParams{
+		Content: &updated,
+	})
+	if err != nil {
+		t.Fatalf("update observation: %v", err)
+	}
+
+	var accessCount int
+	err = s.db.QueryRow("SELECT access_count FROM observations WHERE id = ?", obsID).Scan(&accessCount)
+	if err != nil {
+		t.Fatalf("query access_count: %v", err)
+	}
+	if accessCount != 0 {
+		t.Fatalf("access_count = %d after UpdateObservation, want 0 (getObservationTx must not bump)", accessCount)
+	}
+}
+
+// T2.3: Sync apply path (getObservationBySyncIDTx) does NOT bump access_count
+func TestSyncApplyDoesNotBumpAccess(t *testing.T) {
+	s := newTestStore(t)
+
+	if err := s.CreateSession("s1", "proj", "/tmp/proj"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	obsID, err := s.AddObservation(AddObservationParams{
+		SessionID: "s1",
+		Type:      "decision",
+		Title:     "Sync no bump test",
+		Content:   "content",
+		Project:   "proj",
+		Scope:     "project",
+	})
+	if err != nil {
+		t.Fatalf("add observation: %v", err)
+	}
+
+	// Get the sync_id for this observation
+	obs, err := s.GetObservation(obsID)
+	if err != nil {
+		t.Fatalf("get observation: %v", err)
+	}
+	syncID := obs.SyncID
+
+	// Reset the access_count back to 0 (GetObservation bumped it)
+	_, err = s.db.Exec("UPDATE observations SET access_count = 0, last_accessed_at = NULL WHERE id = ?", obsID)
+	if err != nil {
+		t.Fatalf("reset access_count: %v", err)
+	}
+
+	// Simulate a sync-pull update that references this observation
+	// applyObservationUpsertTx calls getObservationBySyncIDTx internally
+	proj := "proj"
+	payload := syncObservationPayload{
+		SyncID:    syncID,
+		SessionID: "s1",
+		Type:      "decision",
+		Title:     "Sync no bump test",
+		Content:   "updated via sync",
+		Project:   &proj,
+		Scope:     "project",
+	}
+	err = s.withTx(func(tx *sql.Tx) error {
+		return s.applyObservationUpsertTx(tx, payload)
+	})
+	if err != nil {
+		t.Fatalf("apply observation upsert: %v", err)
+	}
+
+	// access_count must remain 0 — sync path must not bump
+	var accessCount int
+	err = s.db.QueryRow("SELECT access_count FROM observations WHERE id = ?", obsID).Scan(&accessCount)
+	if err != nil {
+		t.Fatalf("query access_count: %v", err)
+	}
+	if accessCount != 0 {
+		t.Fatalf("access_count = %d after sync apply, want 0 (sync path must not bump)", accessCount)
+	}
+}

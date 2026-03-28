@@ -1423,6 +1423,14 @@ func (s *Store) GetObservation(id int64) (*Observation, error) {
 	); err != nil {
 		return nil, err
 	}
+
+	// Fire-and-forget access bump — no transaction wrapping for speed.
+	// This intentionally does NOT update the returned struct; callers that
+	// need the post-bump value can re-query.
+	_, _ = s.db.Exec(
+		`UPDATE observations SET access_count = access_count + 1, last_accessed_at = datetime('now') WHERE id = ?`, id,
+	)
+
 	return &o, nil
 }
 
